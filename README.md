@@ -22,6 +22,21 @@ This app is designed for users who hate the rigid structure of the iTunes Librar
 
 ---
 
+## ⚙️ How it works (The Technical Flow)
+
+Ever wondered how the app bypasses the manual iTunes struggle? Here is the step-by-step process executed every time you click **Launch Sync**:
+
+1.  **Folder Analysis:** The script scans your selected local folder for `.mp3` files.
+2.  **File Sanitization (Slugify):** To prevent database corruption or sync errors, filenames are stripped of special characters and converted to a clean format (e.g., `01 - My Song! @2024.mp3` becomes `01_my_song_2024.mp3`).
+3.  **Lazy Tagging:** The script injects the **Folder Name** into the *Album* and *Artist* metadata fields of every song. This forces the iPod to group them together perfectly, regardless of their original tags.
+4.  **iTunes COM Hijacking:** Using the `win32com` library, the app opens a secure communication bridge with the iTunes background process.
+5.  **Smart Upload:** * It checks if a song's "Slug" is already in the iPod's library.
+    * If **New**: It physically transfers the file.
+    * If **Existing**: It simply creates a shortcut (link) to the existing file to save space.
+6.  **Database Stabilization:** The app monitors `LibraryUpdateStatus` in real-time. It waits for iTunes to finish writing the raw data to the iPod's physical disk before releasing the lock, preventing the "Syncing..." loop or database corruption.
+
+---
+
 ## 🛠 Prerequisites & Setup
 
 ### 1. iTunes Configuration (CRITICAL)
