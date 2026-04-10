@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>iPod Sync System</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
+<style>
+    :root { --accent: #00e5ff; --bg: #050508; --panel: #0d0d14; --text: #cdd6f4; --border: #1e1e2e; --danger: #f38ba8; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Rajdhani', sans-serif; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+    header { padding: 15px 40px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    .main-container { display: flex; flex: 1; padding: 25px; gap: 25px; min-height: 0; }
+    .left-panel { flex: 0 0 380px; display: flex; flex-direction: column; gap: 15px; }
+    .right-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+    .card-label { font-family: 'Share Tech Mono'; font-size: 11px; color: var(--accent); letter-spacing: 2px; margin-bottom: 10px; display: block; }
+    .ipod-bar { display: flex; align-items: center; gap: 10px; font-family: 'Share Tech Mono'; font-size: 12px; background: #000; padding: 8px; border-radius: 5px; margin-bottom: 10px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #333; }
+    .dot.on { background: #a6e3a1; box-shadow: 0 0 5px #a6e3a1; }
+    .path-box { background: #000; padding: 10px; font-family: 'Share Tech Mono'; font-size: 12px; color: var(--accent); border-radius: 5px; overflow: hidden; text-overflow: ellipsis; }
+    .btn { background: var(--accent); color: #000; border: none; padding: 10px; border-radius: 5px; font-weight: 700; cursor: pointer; width: 100%; font-family: 'Rajdhani'; transition: opacity 0.2s; }
+    .btn:disabled { opacity: 0.3; pointer-events: none; cursor: not-allowed; }
+    .btn-danger { background: var(--danger); }
+    .pl-select { width: 100%; background: #000; color: var(--accent); border: 1px solid var(--border); padding: 8px; border-radius: 5px; font-family: 'Share Tech Mono'; margin-bottom: 10px; }
+    .terminal { background: #020205; flex: 1; border-radius: 8px; padding: 15px; font-family: 'Share Tech Mono'; font-size: 13px; color: #a6e3a1; overflow-y: scroll; border: 1px solid var(--border); min-height: 0; }
+    .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); align-items: center; justify-content: center; z-index: 100; }
+    
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-track { background: #050508; border-left: 1px solid #1e1e2e; }
+    ::-webkit-scrollbar-thumb { background: #00e5ff; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #70efff; box-shadow: 0 0 10px #00e5ff; }
+</style>
+</head>
+<body>
+
+<header>
+    <div style="font-family:'Share Tech Mono'; letter-spacing:3px;">IPOD_SYNC_OS</div>
+    <div id="status-tag" style="font-size:12px; color:var(--accent);">READY</div>
+</header>
+
+<div class="main-container">
+    <div class="left-panel">
+        <div class="card">
+            <span class="card-label">01 / DEVICE</span>
+            <div class="ipod-bar"><div id="ipod-dot" class="dot"></div> <span id="ipod-label">Checking...</span></div>
+            <div class="path-box" id="path-box">--- NO FOLDER ---</div>
+            <button class="btn" id="btn-browse" onclick="pickFolder()" style="margin-top:10px;">BROWSE FOLDER</button>
+        </div>
+
+        <div class="card">
+            <span class="card-label">02 / ACTIONS</span>
+            <button id="sync-btn" class="btn" onclick="startSync()" disabled>LAUNCH SYNC</button>
+        </div>
+
+        <div class="card">
+            <span class="card-label">03 / MAINTENANCE</span>
+            <select id="pl-select" class="pl-select"><option>-- no iPod --</option></select>
+            <div style="display:flex; gap:10px;">
+                <button class="btn" id="btn-refresh" onclick="refreshIpod()" style="flex:0 0 50px;">↻</button>
+                <button id="del-btn" class="btn btn-danger" onclick="showModal()" disabled>DELETE PLAYLIST</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="right-panel">
+        <div class="terminal" id="term">> System online...</div>
+    </div>
+</div>
+
+<div id="modal" class="modal">
+    <div class="card" style="width:300px; text-align:center;">
+        <h3 style="color:var(--danger); margin-bottom:15px;">CONFIRM PURGE?</h3>
+        <p style="font-size:13px; margin-bottom:20px;">This will physically remove all files in this playlist from the iPod memory.</p>
+        <button class="btn btn-danger" onclick="doDelete()">YES, PURGE</button>
+        <button class="btn" onclick="closeModal()" style="background:none; color:white; margin-top:10px;">CANCEL</button>
+    </div>
+</div>
+
+<script>
+    let selectedPath     = "";
+    let playlistToDelete = "";
+    let isBusy           = false;
+
+    function lockUI() {
+        isBusy = true;
+        document.getElementById('status-tag').textContent = "BUSY - PROCESSING";
+        document.getElementById('status-tag').style.color = "var(--danger)";
+        ['sync-btn', 'del-btn', 'pl-select', 'btn-refresh', 'btn-browse'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = true;
+        });
+    }
+
+    function unlockUI() {
+        isBusy = false;
+        document.getElementById('status-tag').textContent = "READY";
+        document.getElementById('status-tag').style.color = "var(--accent)";
+        document.getElementById('btn-refresh').disabled = false;
+        document.getElementById('btn-browse').disabled = false;
+        document.getElementById('pl-select').disabled = false;
+        
+        if (selectedPath) document.getElementById('sync-btn').disabled = false;
+        const sel = document.getElementById('pl-select');
+        document.getElementById('del-btn').disabled = !sel.value;
+    }
+
+    async function checkIpod() {
+        if (isBusy) return;
+        try {
+            const response = await fetch('/api/ipod-status', { method: 'POST' });
+            const data = await response.json();
+            const dot = document.getElementById('ipod-dot');
+            const label = document.getElementById('ipod-label');
+            const refreshBtn = document.getElementById('btn-refresh');
+
+            if (data.connected) {
+                dot.className = 'dot on';
+                label.textContent = `iPod: ${data.name}`;
+                label.style.color = 'var(--accent)';
+                if (refreshBtn) refreshBtn.disabled = false;
+                await loadPlaylists();
+            } else {
+                dot.className = 'dot';
+                label.textContent = 'iPod not detected';
+                label.style.color = 'var(--text)';
+                const sel = document.getElementById('pl-select');
+                if (sel) {
+                    sel.innerHTML = '<option value="">-- No iPod --</option>';
+                    sel.disabled = true;
+                }
+                if (refreshBtn) refreshBtn.disabled = true;
+                document.getElementById('del-btn').disabled = true;
+            }
+        } catch (error) {
+            document.getElementById('ipod-label').textContent = "Server connection error";
+        }
+    }
+
+    async function refreshIpod() {
+        if (isBusy) return;
+        await checkIpod();
+    }
+
+    async function loadPlaylists() {
+        if (isBusy) return;
+        const r = await fetch('/api/list-playlists', {method:'POST'});
+        const d = await r.json();
+        const sel = document.getElementById('pl-select');
+        if (d.playlists) {
+            const prev = sel.value;
+            sel.innerHTML = d.playlists.map(p => `<option value="${p}">${p}</option>`).join('');
+            if (prev && d.playlists.includes(prev)) sel.value = prev;
+            document.getElementById('del-btn').disabled = d.playlists.length === 0;
+        }
+    }
+
+    async function pickFolder() {
+        if (isBusy) return;
+        try {
+            const r = await fetch('/api/browse-folder', { method: 'POST' });
+            const d = await r.json();
+            if (d.folder && d.folder !== "None" && d.folder !== true) {
+                selectedPath = d.folder;
+                document.getElementById('path-box').textContent = d.folder;
+                document.getElementById('path-box').style.color = 'var(--accent)';
+                const r2 = await fetch('/api/list-mp3', {
+                    method: 'POST', 
+                    headers: {'Content-Type': 'application/json'}, 
+                    body: JSON.stringify({ folder: d.folder })
+                });
+                const d2 = await r2.json();
+                if (d2.count > 0) {
+                    document.getElementById('sync-btn').disabled = false;
+                    document.getElementById('term').innerHTML += `<div>> Folder linked: ${d2.count} files detected.</div>`;
+                } else {
+                    document.getElementById('sync-btn').disabled = true;
+                    document.getElementById('term').innerHTML += `<div style="color:var(--danger)">> No MP3 found in this folder.</div>`;
+                }
+            }
+        } catch (e) {}
+    }
+
+    function showModal() {
+        if (isBusy) return;
+        const pl = document.getElementById('pl-select').value;
+        if (!pl) return;
+        playlistToDelete = pl;
+        document.getElementById('modal').style.display = 'flex';
+    }
+    function closeModal() { document.getElementById('modal').style.display = 'none'; }
+
+    async function startSync() {
+        if (isBusy || !selectedPath) return;
+        lockUI();
+        await executeStream('/api/sync', {folder: selectedPath});
+        unlockUI();
+        await checkIpod();
+    }
+
+    async function doDelete() {
+        closeModal();
+        if (isBusy) return;
+        lockUI();
+        await executeStream('/api/delete-playlist', {playlist: playlistToDelete});
+        unlockUI();
+        await checkIpod();
+    }
+
+    async function executeStream(url, body) {
+        const term = document.getElementById('term');
+        term.innerHTML = "";
+        try {
+            const res = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+                const {done, value} = await reader.read();
+                if (done) break;
+                decoder.decode(value).split('\n').forEach(line => {
+                    if (!line.startsWith('data: ')) return;
+                    const msg = line.slice(6);
+                    term.innerHTML += `<div>${msg}</div>`;
+                    term.scrollTop = term.scrollHeight;
+                });
+            }
+        } catch(e) {
+            term.innerHTML += `<div style="color:var(--danger)">❌ Error: ${e.message}</div>`;
+        }
+    }
+
+    checkIpod();
+</script>
+</body>
+</html>
