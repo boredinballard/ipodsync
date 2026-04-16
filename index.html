@@ -5,7 +5,7 @@
 <title>iPod Sync System</title>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
 <style>
-    :root { --accent: #00e5ff; --bg: #050508; --panel: #0d0d14; --text: #cdd6f4; --border: #1e1e2e; --danger: #f38ba8; }
+    :root { --accent: #00e5ff; --bg: #050508; --panel: #0d0d14; --text: #cdd6f4; --border: #1e1e2e; --danger: #f38ba8; --danger-dim: #45222d; --success: #a6e3a1; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: var(--bg); color: var(--text); font-family: 'Rajdhani', sans-serif; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
     header { padding: 15px 40px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
@@ -18,13 +18,76 @@
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #333; }
     .dot.on { background: #a6e3a1; box-shadow: 0 0 5px #a6e3a1; }
     .path-box { background: #000; padding: 10px; font-family: 'Share Tech Mono'; font-size: 12px; color: var(--accent); border-radius: 5px; overflow: hidden; text-overflow: ellipsis; }
-    .btn { background: var(--accent); color: #000; border: none; padding: 10px; border-radius: 5px; font-weight: 700; cursor: pointer; width: 100%; font-family: 'Rajdhani'; transition: opacity 0.2s; }
+    .btn { background: var(--accent); color: #000; border: none; padding: 10px; border-radius: 5px; font-weight: 700; cursor: pointer; width: 100%; font-family: 'Rajdhani'; transition: opacity 0.2s, background 0.2s; font-size: 14px; }
     .btn:disabled { opacity: 0.3; pointer-events: none; cursor: not-allowed; }
-    .btn-danger { background: var(--danger); }
-    .pl-select { width: 100%; background: #000; color: var(--accent); border: 1px solid var(--border); padding: 8px; border-radius: 5px; font-family: 'Share Tech Mono'; margin-bottom: 10px; }
-    .terminal { background: #020205; flex: 1; border-radius: 8px; padding: 15px; font-family: 'Share Tech Mono'; font-size: 13px; color: #a6e3a1; overflow-y: scroll; border: 1px solid var(--border); min-height: 0; }
-    .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); align-items: center; justify-content: center; z-index: 100; }
-    
+    .btn:hover:not(:disabled) { opacity: 0.85; }
+
+    /* --- Tab Bar --- */
+    .tab-bar { display: flex; gap: 0; margin-bottom: 0; flex-shrink: 0; }
+    .tab { padding: 10px 24px; font-family: 'Share Tech Mono'; font-size: 12px; letter-spacing: 2px; cursor: pointer; border: 1px solid var(--border); border-bottom: none; border-radius: 8px 8px 0 0; background: transparent; color: #555; transition: all 0.25s ease; user-select: none; }
+    .tab:hover { color: var(--text); background: rgba(0, 229, 255, 0.03); }
+    .tab.active { color: var(--accent); background: var(--panel); border-color: var(--border); position: relative; }
+    .tab.active::after { content: ''; position: absolute; bottom: -1px; left: 0; right: 0; height: 1px; background: var(--panel); }
+    .tab-content { flex: 1; min-height: 0; display: none; flex-direction: column; background: var(--panel); border: 1px solid var(--border); border-radius: 0 8px 8px 8px; overflow: hidden; }
+    .tab-content.active { display: flex; }
+
+    /* --- Terminal --- */
+    .terminal { flex: 1; padding: 15px; font-family: 'Share Tech Mono'; font-size: 13px; color: #a6e3a1; overflow-y: auto; min-height: 0; }
+
+    /* --- Library Tree --- */
+    .library-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+    .library-tree { flex: 1; overflow-y: auto; padding: 12px 15px; }
+    .library-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 12px; color: #555; font-family: 'Share Tech Mono'; font-size: 13px; letter-spacing: 1px; }
+    .library-empty .empty-icon { font-size: 36px; opacity: 0.3; }
+    .library-stats { padding: 10px 15px; border-bottom: 1px solid var(--border); font-family: 'Share Tech Mono'; font-size: 11px; color: #555; display: flex; justify-content: space-between; align-items: center; }
+
+    /* Tree nodes */
+    .tree-node { user-select: none; }
+    .tree-children { overflow: hidden; transition: max-height 0.3s ease, opacity 0.2s ease; }
+    .tree-children.collapsed { max-height: 0 !important; opacity: 0; }
+    .tree-row { display: flex; align-items: center; gap: 6px; padding: 4px 4px; border-radius: 4px; cursor: pointer; transition: background 0.15s ease; }
+    .tree-row:hover { background: rgba(255,255,255,0.03); }
+    .tree-arrow { width: 18px; text-align: center; font-size: 10px; color: #555; transition: transform 0.25s ease; flex-shrink: 0; }
+    .tree-arrow.expanded { transform: rotate(90deg); }
+    .tree-check { width: 16px; height: 16px; border: 2px solid #333; border-radius: 3px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: all 0.15s ease; cursor: pointer; }
+    .tree-check.checked { background: var(--accent); border-color: var(--accent); }
+    .tree-check.checked::after { content: '✓'; font-size: 11px; color: #000; font-weight: bold; }
+    .tree-check.indeterminate { border-color: var(--accent); }
+    .tree-check.indeterminate::after { content: ''; width: 8px; height: 2px; background: var(--accent); display: block; }
+    .tree-label { font-family: 'Rajdhani', sans-serif; font-size: 14px; font-weight: 600; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree-track .tree-label { font-weight: 400; font-size: 13px; color: #999; }
+    .tree-track .tree-row:hover .tree-label { color: var(--text); }
+    .tree-badge { font-family: 'Share Tech Mono'; font-size: 10px; color: #555; background: rgba(255,255,255,0.05); padding: 1px 7px; border-radius: 8px; flex-shrink: 0; }
+
+    /* Artist row styling */
+    .tree-artist > .tree-row { padding: 6px 4px; }
+    .tree-artist > .tree-row .tree-label { color: var(--accent); font-size: 14px; }
+    .tree-album > .tree-row { padding-left: 28px; }
+    .tree-album > .tree-row .tree-label { color: var(--text); font-size: 13px; }
+    .tree-track .tree-row { padding-left: 56px; }
+
+    /* Delete bar */
+    .delete-bar { padding: 12px 15px; border-top: 1px solid var(--border); display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
+    .btn-danger { background: var(--danger-dim); color: var(--danger); border: 1px solid var(--danger); width: auto; padding: 8px 20px; font-size: 13px; letter-spacing: 1px; }
+    .btn-danger:hover:not(:disabled) { background: var(--danger); color: #000; opacity: 1; }
+    .delete-count { font-family: 'Share Tech Mono'; font-size: 12px; color: #555; }
+
+    /* Confirm modal */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 100; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
+    .modal-overlay.visible { opacity: 1; pointer-events: all; }
+    .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 28px; max-width: 420px; width: 90%; }
+    .modal h3 { font-family: 'Share Tech Mono'; color: var(--danger); font-size: 14px; letter-spacing: 2px; margin-bottom: 14px; }
+    .modal p { font-size: 14px; color: var(--text); margin-bottom: 20px; line-height: 1.5; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+    .modal-actions .btn { width: auto; padding: 8px 22px; font-size: 13px; }
+    .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    .btn-ghost:hover:not(:disabled) { background: rgba(255,255,255,0.05); opacity: 1; }
+
+    /* Loading spinner */
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #333; border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Scrollbar */
     ::-webkit-scrollbar { width: 8px; }
     ::-webkit-scrollbar-track { background: #050508; border-left: 1px solid #1e1e2e; }
     ::-webkit-scrollbar-thumb { background: #00e5ff; border-radius: 4px; }
@@ -43,6 +106,7 @@
         <div class="card">
             <span class="card-label">01 / DEVICE</span>
             <div class="ipod-bar"><div id="ipod-dot" class="dot"></div> <span id="ipod-label">Checking...</span></div>
+            <div class="ipod-bar"><div id="ffmpeg-dot" class="dot"></div> <span id="ffmpeg-label">FFmpeg: checking...</span></div>
             <div class="path-box" id="path-box">--- NO FOLDER ---</div>
             <button class="btn" id="btn-browse" onclick="pickFolder()" style="margin-top:10px;">BROWSE FOLDER</button>
         </div>
@@ -53,39 +117,66 @@
         </div>
 
         <div class="card">
-            <span class="card-label">03 / MAINTENANCE</span>
-            <select id="pl-select" class="pl-select"><option>-- no iPod --</option></select>
-            <div style="display:flex; gap:10px;">
-                <button class="btn" id="btn-refresh" onclick="refreshIpod()" style="flex:0 0 50px;">↻</button>
-                <button id="del-btn" class="btn btn-danger" onclick="showModal()" disabled>DELETE PLAYLIST</button>
-            </div>
+            <span class="card-label">03 / LIBRARY</span>
+            <button id="refresh-btn" class="btn" onclick="refreshLibrary()">REFRESH LIBRARY</button>
         </div>
     </div>
 
     <div class="right-panel">
-        <div class="terminal" id="term">> System online...</div>
+        <div class="tab-bar">
+            <div class="tab active" id="tab-terminal" onclick="switchTab('terminal')">TERMINAL</div>
+            <div class="tab" id="tab-library" onclick="switchTab('library')">LIBRARY</div>
+        </div>
+
+        <div class="tab-content active" id="content-terminal">
+            <div class="terminal" id="term">> System online...</div>
+        </div>
+
+        <div class="tab-content" id="content-library">
+            <div class="library-panel">
+                <div class="library-stats" id="library-stats" style="display:none;">
+                    <span id="lib-stat-text">0 artists · 0 albums · 0 tracks</span>
+                    <span id="lib-loading" style="display:none;"><span class="spinner"></span> Loading...</span>
+                </div>
+                <div class="library-tree" id="library-tree">
+                    <div class="library-empty">
+                        <div class="empty-icon">📱</div>
+                        <div>Click REFRESH LIBRARY to scan your iPod</div>
+                    </div>
+                </div>
+                <div class="delete-bar" id="delete-bar" style="display:none;">
+                    <button class="btn btn-danger" id="delete-btn" onclick="deleteSelected()" disabled>🗑️ DELETE SELECTED</button>
+                    <span class="delete-count" id="delete-count">0 tracks selected</span>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
-<div id="modal" class="modal">
-    <div class="card" style="width:300px; text-align:center;">
-        <h3 style="color:var(--danger); margin-bottom:15px;">CONFIRM PURGE?</h3>
-        <p style="font-size:13px; margin-bottom:20px;">This will physically remove all files in this playlist from the iPod memory.</p>
-        <button class="btn btn-danger" onclick="doDelete()">YES, PURGE</button>
-        <button class="btn" onclick="closeModal()" style="background:none; color:white; margin-top:10px;">CANCEL</button>
+<!-- Delete confirmation modal -->
+<div class="modal-overlay" id="confirm-modal">
+    <div class="modal">
+        <h3>⚠ CONFIRM DELETION</h3>
+        <p id="confirm-msg">Are you sure you want to delete these tracks from your iPod?</p>
+        <div class="modal-actions">
+            <button class="btn btn-ghost" onclick="closeModal()">CANCEL</button>
+            <button class="btn btn-danger" id="confirm-delete-btn" onclick="confirmDelete()">DELETE</button>
+        </div>
     </div>
 </div>
 
 <script>
-    let selectedPath     = "";
-    let playlistToDelete = "";
-    let isBusy           = false;
+    let selectedPath = "";
+    let isBusy       = false;
+    let libraryData  = [];       // Raw library JSON from API
+    let trackMap     = new Map(); // trackId -> full track object (for future metadata editor)
 
+    // ─── UI Lock ───────────────────────────────────────────────
     function lockUI() {
         isBusy = true;
         document.getElementById('status-tag').textContent = "BUSY - PROCESSING";
         document.getElementById('status-tag').style.color = "var(--danger)";
-        ['sync-btn', 'del-btn', 'pl-select', 'btn-refresh', 'btn-browse'].forEach(id => {
+        ['btn-browse', 'refresh-btn', 'delete-btn'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.disabled = true;
         });
@@ -95,15 +186,21 @@
         isBusy = false;
         document.getElementById('status-tag').textContent = "READY";
         document.getElementById('status-tag').style.color = "var(--accent)";
-        document.getElementById('btn-refresh').disabled = false;
         document.getElementById('btn-browse').disabled = false;
-        document.getElementById('pl-select').disabled = false;
-        
+        document.getElementById('refresh-btn').disabled = false;
         if (selectedPath) document.getElementById('sync-btn').disabled = false;
-        const sel = document.getElementById('pl-select');
-        document.getElementById('del-btn').disabled = !sel.value;
+        updateDeleteCount();
     }
 
+    // ─── Tab Switching ─────────────────────────────────────────
+    function switchTab(name) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        document.getElementById('tab-' + name).classList.add('active');
+        document.getElementById('content-' + name).classList.add('active');
+    }
+
+    // ─── iPod Status ───────────────────────────────────────────
     async function checkIpod() {
         if (isBusy) return;
         try {
@@ -111,49 +208,47 @@
             const data = await response.json();
             const dot = document.getElementById('ipod-dot');
             const label = document.getElementById('ipod-label');
-            const refreshBtn = document.getElementById('btn-refresh');
 
             if (data.connected) {
                 dot.className = 'dot on';
                 label.textContent = `iPod: ${data.name}`;
                 label.style.color = 'var(--accent)';
-                if (refreshBtn) refreshBtn.disabled = false;
-                await loadPlaylists();
             } else {
                 dot.className = 'dot';
                 label.textContent = 'iPod not detected';
                 label.style.color = 'var(--text)';
-                const sel = document.getElementById('pl-select');
-                if (sel) {
-                    sel.innerHTML = '<option value="">-- No iPod --</option>';
-                    sel.disabled = true;
-                }
-                if (refreshBtn) refreshBtn.disabled = true;
-                document.getElementById('del-btn').disabled = true;
             }
         } catch (error) {
             document.getElementById('ipod-label').textContent = "Server connection error";
         }
     }
 
-    async function refreshIpod() {
-        if (isBusy) return;
-        await checkIpod();
-    }
-
-    async function loadPlaylists() {
-        if (isBusy) return;
-        const r = await fetch('/api/list-playlists', {method:'POST'});
-        const d = await r.json();
-        const sel = document.getElementById('pl-select');
-        if (d.playlists) {
-            const prev = sel.value;
-            sel.innerHTML = d.playlists.map(p => `<option value="${p}">${p}</option>`).join('');
-            if (prev && d.playlists.includes(prev)) sel.value = prev;
-            document.getElementById('del-btn').disabled = d.playlists.length === 0;
+    // ─── FFmpeg Check ──────────────────────────────────────────
+    async function checkFfmpeg() {
+        try {
+            const r = await fetch('/api/check-ffmpeg', { method: 'POST' });
+            const d = await r.json();
+            const dot = document.getElementById('ffmpeg-dot');
+            const label = document.getElementById('ffmpeg-label');
+            if (d.installed) {
+                dot.className = 'dot on';
+                label.textContent = d.version;
+                label.style.color = 'var(--accent)';
+                document.getElementById('term').innerHTML += `<div>> FFmpeg detected ✓</div>`;
+            } else {
+                dot.className = 'dot';
+                dot.style.background = 'var(--danger)';
+                dot.style.boxShadow = '0 0 5px var(--danger)';
+                label.textContent = 'FFmpeg: NOT FOUND';
+                label.style.color = 'var(--danger)';
+                document.getElementById('term').innerHTML += `<div style="color:var(--danger)"> ⚠ FFmpeg not found — FLAC conversion disabled. ${d.error || ''}</div>`;
+            }
+        } catch(e) {
+            document.getElementById('ffmpeg-label').textContent = 'FFmpeg: check failed';
         }
     }
 
+    // ─── Folder Picker ─────────────────────────────────────────
     async function pickFolder() {
         if (isBusy) return;
         try {
@@ -174,36 +269,46 @@
                     document.getElementById('term').innerHTML += `<div>> Folder linked: ${d2.count} files detected.</div>`;
                 } else {
                     document.getElementById('sync-btn').disabled = true;
-                    document.getElementById('term').innerHTML += `<div style="color:var(--danger)">> No MP3 found in this folder.</div>`;
+                    document.getElementById('term').innerHTML += `<div style="color:var(--danger)">> No audio files found (.mp3, .flac).</div>`;
                 }
             }
         } catch (e) {}
     }
 
-    function showModal() {
-        if (isBusy) return;
-        const pl = document.getElementById('pl-select').value;
-        if (!pl) return;
-        playlistToDelete = pl;
-        document.getElementById('modal').style.display = 'flex';
-    }
-    function closeModal() { document.getElementById('modal').style.display = 'none'; }
-
+    // ─── Sync ──────────────────────────────────────────────────
     async function startSync() {
         if (isBusy || !selectedPath) return;
+        switchTab('terminal');
         lockUI();
+
+        // Transform sync button into cancel button
+        const btn = document.getElementById('sync-btn');
+        btn.textContent = '⛔ CANCEL SYNC';
+        btn.className = 'btn btn-danger';
+        btn.disabled = false;
+        btn.onclick = cancelSync;
+
         await executeStream('/api/sync', {folder: selectedPath});
+
+        // Revert button
+        btn.textContent = 'LAUNCH SYNC';
+        btn.className = 'btn';
+        btn.onclick = startSync;
+
         unlockUI();
         await checkIpod();
     }
 
-    async function doDelete() {
-        closeModal();
-        if (isBusy) return;
-        lockUI();
-        await executeStream('/api/delete-playlist', {playlist: playlistToDelete});
-        unlockUI();
-        await checkIpod();
+    async function cancelSync() {
+        try {
+            const btn = document.getElementById('sync-btn');
+            btn.disabled = true;
+            btn.textContent = '⏳ CANCELLING...';
+            await fetch('/api/cancel-sync', { method: 'POST' });
+            const term = document.getElementById('term');
+            term.innerHTML += `<div style="color:var(--danger)">⏹ Cancel requested — finishing current file...</div>`;
+            term.scrollTop = term.scrollHeight;
+        } catch(e) {}
     }
 
     async function executeStream(url, body) {
@@ -228,7 +333,302 @@
         }
     }
 
+    // ─── Library Management ────────────────────────────────────
+    async function refreshLibrary() {
+        if (isBusy) return;
+        switchTab('library');
+
+        const statsBar = document.getElementById('library-stats');
+        const loadingEl = document.getElementById('lib-loading');
+        const statText = document.getElementById('lib-stat-text');
+        const treeEl = document.getElementById('library-tree');
+        const deleteBar = document.getElementById('delete-bar');
+
+        statsBar.style.display = 'flex';
+        loadingEl.style.display = 'inline';
+        statText.textContent = 'Scanning...';
+        treeEl.innerHTML = '';
+        deleteBar.style.display = 'none';
+
+        try {
+            const r = await fetch('/api/ipod-library', { method: 'POST' });
+            const d = await r.json();
+            loadingEl.style.display = 'none';
+
+            if (!d.connected) {
+                statText.textContent = 'iPod not connected';
+                treeEl.innerHTML = '<div class="library-empty"><div class="empty-icon">⚠️</div><div>iPod not detected. Connect your device and try again.</div></div>';
+                return;
+            }
+
+            libraryData = d.library;
+            trackMap.clear();
+
+            let totalArtists = libraryData.length;
+            let totalAlbums = 0;
+            let totalTracks = 0;
+            libraryData.forEach(a => {
+                totalAlbums += a.albums.length;
+                a.albums.forEach(al => {
+                    totalTracks += al.tracks.length;
+                    al.tracks.forEach(t => trackMap.set(t.trackId, t));
+                });
+            });
+
+            statText.textContent = `${totalArtists} artist${totalArtists !== 1 ? 's' : ''} · ${totalAlbums} album${totalAlbums !== 1 ? 's' : ''} · ${totalTracks} track${totalTracks !== 1 ? 's' : ''}`;
+
+            if (totalTracks === 0) {
+                treeEl.innerHTML = '<div class="library-empty"><div class="empty-icon">🎵</div><div>No tracks found on iPod</div></div>';
+                return;
+            }
+
+            buildTree(libraryData, treeEl);
+            deleteBar.style.display = 'flex';
+            updateDeleteCount();
+
+        } catch(e) {
+            loadingEl.style.display = 'none';
+            statText.textContent = 'Error loading library';
+            treeEl.innerHTML = `<div class="library-empty"><div class="empty-icon">❌</div><div>Failed to load: ${e.message}</div></div>`;
+        }
+    }
+
+    // ─── Tree Builder ──────────────────────────────────────────
+    function buildTree(library, container) {
+        library.forEach(artist => {
+            const artistTrackCount = artist.albums.reduce((s, al) => s + al.tracks.length, 0);
+            const artistNode = createNode('artist', artist.name, artistTrackCount);
+
+            artist.albums.forEach(album => {
+                const albumNode = createNode('album', album.name, album.tracks.length);
+
+                album.tracks.forEach(track => {
+                    const trackNode = createNode('track', track.name, null, track.trackId);
+                    albumNode.querySelector('.tree-children').appendChild(trackNode);
+                });
+
+                artistNode.querySelector('.tree-children').appendChild(albumNode);
+            });
+
+            container.appendChild(artistNode);
+        });
+    }
+
+    function createNode(type, label, count, trackId) {
+        const node = document.createElement('div');
+        node.className = `tree-node tree-${type}`;
+
+        const row = document.createElement('div');
+        row.className = 'tree-row';
+
+        if (type !== 'track') {
+            const arrow = document.createElement('div');
+            arrow.className = 'tree-arrow expanded';
+            arrow.textContent = '▶';
+            arrow.addEventListener('click', (e) => { e.stopPropagation(); toggleExpand(node); });
+            row.appendChild(arrow);
+        } else {
+            // Spacer for alignment
+            const spacer = document.createElement('div');
+            spacer.style.width = '18px';
+            spacer.style.flexShrink = '0';
+            row.appendChild(spacer);
+        }
+
+        const check = document.createElement('div');
+        check.className = 'tree-check';
+        check.addEventListener('click', (e) => { e.stopPropagation(); toggleCheck(node); });
+        row.appendChild(check);
+
+        const labelEl = document.createElement('div');
+        labelEl.className = 'tree-label';
+        labelEl.textContent = label;
+        row.appendChild(labelEl);
+
+        if (count !== null && count !== undefined) {
+            const badge = document.createElement('div');
+            badge.className = 'tree-badge';
+            badge.textContent = count;
+            row.appendChild(badge);
+        }
+
+        if (trackId !== undefined) {
+            node.dataset.trackId = trackId;
+        }
+
+        node.appendChild(row);
+
+        if (type !== 'track') {
+            const children = document.createElement('div');
+            children.className = 'tree-children';
+            node.appendChild(children);
+        }
+
+        // Click row to toggle check
+        row.addEventListener('click', () => toggleCheck(node));
+
+        return node;
+    }
+
+    // ─── Expand / Collapse ─────────────────────────────────────
+    function toggleExpand(node) {
+        const children = node.querySelector(':scope > .tree-children');
+        const arrow = node.querySelector(':scope > .tree-row > .tree-arrow');
+        if (!children || !arrow) return;
+
+        if (children.classList.contains('collapsed')) {
+            children.style.maxHeight = children.scrollHeight + 'px';
+            children.classList.remove('collapsed');
+            arrow.classList.add('expanded');
+            // After transition, remove max-height to allow dynamic content
+            setTimeout(() => { if (!children.classList.contains('collapsed')) children.style.maxHeight = 'none'; }, 300);
+        } else {
+            children.style.maxHeight = children.scrollHeight + 'px';
+            // Force reflow
+            children.offsetHeight;
+            children.style.maxHeight = '0px';
+            children.classList.add('collapsed');
+            arrow.classList.remove('expanded');
+        }
+    }
+
+    // ─── Tri-State Checkbox ────────────────────────────────────
+    function toggleCheck(node) {
+        const check = node.querySelector(':scope > .tree-row > .tree-check');
+        const isChecked = check.classList.contains('checked');
+
+        // Toggle: if checked or indeterminate -> uncheck; else -> check
+        const newState = !isChecked && !check.classList.contains('indeterminate');
+
+        setCheckState(node, newState);
+        // Cascade up to update parent state
+        cascadeUp(node);
+        updateDeleteCount();
+    }
+
+    function setCheckState(node, checked) {
+        const check = node.querySelector(':scope > .tree-row > .tree-check');
+        check.classList.remove('checked', 'indeterminate');
+        if (checked) check.classList.add('checked');
+
+        // Cascade down to children
+        const children = node.querySelectorAll(':scope > .tree-children > .tree-node');
+        children.forEach(child => setCheckState(child, checked));
+    }
+
+    function cascadeUp(node) {
+        const parent = node.parentElement?.closest('.tree-node');
+        if (!parent) return;
+
+        const children = parent.querySelectorAll(':scope > .tree-children > .tree-node');
+        const checks = Array.from(children).map(c => {
+            const ch = c.querySelector(':scope > .tree-row > .tree-check');
+            return ch.classList.contains('checked') ? 'checked' : ch.classList.contains('indeterminate') ? 'indeterminate' : 'none';
+        });
+
+        const parentCheck = parent.querySelector(':scope > .tree-row > .tree-check');
+        parentCheck.classList.remove('checked', 'indeterminate');
+
+        if (checks.every(s => s === 'checked')) {
+            parentCheck.classList.add('checked');
+        } else if (checks.some(s => s === 'checked' || s === 'indeterminate')) {
+            parentCheck.classList.add('indeterminate');
+        }
+
+        cascadeUp(parent);
+    }
+
+    // ─── Selection Counting ────────────────────────────────────
+    function getSelectedTrackIds() {
+        const ids = [];
+        document.querySelectorAll('.tree-track').forEach(node => {
+            const check = node.querySelector(':scope > .tree-row > .tree-check');
+            if (check.classList.contains('checked')) {
+                ids.push(parseInt(node.dataset.trackId));
+            }
+        });
+        return ids;
+    }
+
+    function updateDeleteCount() {
+        const ids = getSelectedTrackIds();
+        const count = ids.length;
+        const btn = document.getElementById('delete-btn');
+        const countEl = document.getElementById('delete-count');
+
+        btn.disabled = count === 0 || isBusy;
+        countEl.textContent = `${count} track${count !== 1 ? 's' : ''} selected`;
+    }
+
+    // ─── Delete Flow ───────────────────────────────────────────
+    function deleteSelected() {
+        const ids = getSelectedTrackIds();
+        if (ids.length === 0) return;
+
+        // Build a summary of what's being deleted
+        const artistSet = new Set();
+        const albumSet = new Set();
+        document.querySelectorAll('.tree-artist').forEach(artist => {
+            const artistCheck = artist.querySelector(':scope > .tree-row > .tree-check');
+            if (artistCheck.classList.contains('checked') || artistCheck.classList.contains('indeterminate')) {
+                const artistName = artist.querySelector(':scope > .tree-row > .tree-label').textContent;
+                artist.querySelectorAll('.tree-album').forEach(album => {
+                    const albumCheck = album.querySelector(':scope > .tree-row > .tree-check');
+                    if (albumCheck.classList.contains('checked') || albumCheck.classList.contains('indeterminate')) {
+                        albumSet.add(artistName + ' / ' + album.querySelector(':scope > .tree-row > .tree-label').textContent);
+                    }
+                });
+                artistSet.add(artistName);
+            }
+        });
+
+        const msg = `Delete <strong>${ids.length} track${ids.length !== 1 ? 's' : ''}</strong> from <strong>${artistSet.size} artist${artistSet.size !== 1 ? 's' : ''}</strong>?<br><br><span style="color:#555;font-size:12px;font-family:'Share Tech Mono'">This will permanently remove the tracks from your iPod.</span>`;
+        document.getElementById('confirm-msg').innerHTML = msg;
+        document.getElementById('confirm-modal').classList.add('visible');
+    }
+
+    function closeModal() {
+        document.getElementById('confirm-modal').classList.remove('visible');
+    }
+
+    async function confirmDelete() {
+        closeModal();
+        const ids = getSelectedTrackIds();
+        if (ids.length === 0) return;
+
+        lockUI();
+        const term = document.getElementById('term');
+        term.innerHTML += `<div>> Deleting ${ids.length} tracks from iPod...</div>`;
+
+        try {
+            const r = await fetch('/api/delete-tracks', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ trackIds: ids })
+            });
+            const d = await r.json();
+
+            if (d.success) {
+                term.innerHTML += `<div style="color:var(--success)">✅ Deleted ${d.deleted} track${d.deleted !== 1 ? 's' : ''} from iPod.</div>`;
+                if (d.errors && d.errors.length > 0) {
+                    term.innerHTML += `<div style="color:var(--danger)">⚠ ${d.errors.length} error(s) during deletion.</div>`;
+                }
+            } else {
+                term.innerHTML += `<div style="color:var(--danger)">❌ Delete failed: ${d.error}</div>`;
+            }
+            term.scrollTop = term.scrollHeight;
+        } catch(e) {
+            term.innerHTML += `<div style="color:var(--danger)">❌ Error: ${e.message}</div>`;
+        }
+
+        unlockUI();
+        // Auto-refresh library after delete
+        await refreshLibrary();
+    }
+
+    // ─── Init ──────────────────────────────────────────────────
     checkIpod();
+    checkFfmpeg();
 </script>
 </body>
 </html>

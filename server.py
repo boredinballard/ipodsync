@@ -1,4 +1,4 @@
-import re, sys, os, random, string, subprocess, webbrowser, threading, time, queue
+import re, sys, os, random, string, subprocess, webbrowser, threading, time, queue, tempfile, shutil, traceback
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
@@ -7,14 +7,18 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 try:
     import win32com.client
     import pythoncom
+    import mutagen
     from mutagen.mp3 import MP3
     from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, TDRC, ID3NoHeaderError
 except ImportError:
     print("❌ Missing dependencies: pip install flask pywin32 mutagen")
     sys.exit(1)
 
+SUPPORTED_EXTENSIONS = {'.mp3', '.flac'}
+
 app = Flask(__name__)
 is_busy = False # Server global lock
+cancel_event = threading.Event()  # Cancellation signal for sync
 
 # --- TKINTER MANAGEMENT (DEDICATED THREAD) ---
 _tk_queue = queue.Queue()
@@ -62,17 +66,72 @@ def slugify(name: str) -> str:
     slug = slug.strip('_')
     return slug if slug else ''.join(random.choices(string.ascii_uppercase, k=7))
 
-def clean_tags(p: Path, t: str, f: str):
+def strip_year(name: str) -> str:
+    """Remove year patterns from folder/album names.
+    Handles: '2021 - Album', 'Album (2021)', 'Album [2021]', 'Album - 2021'
+    """
+    # Leading year: "2021 - Album Name" or "2021 Album Name"
+    name = re.sub(r'^\d{4}\s*[-–—]\s*', '', name)
+    # Trailing year in parens/brackets: "Album Name (2021)" or "Album Name [2021]"
+    name = re.sub(r'\s*[\(\[]\d{4}[\)\]]\s*$', '', name)
+    # Trailing year with separator: "Album Name - 2021"
+    name = re.sub(r'\s*[-–—]\s*\d{4}\s*$', '', name)
+    return name.strip()
+
+def get_existing_title(p: Path) -> str:
+    """Read the existing title from the file's metadata, or return None."""
     try:
+        tags = ID3(p)
+        title_frames = tags.getall('TIT2')
+        if title_frames and str(title_frames[0]).strip():
+            return str(title_frames[0]).strip()
+    except:
+        pass
+    return None
+
+def get_source_title(p: Path) -> str:
+    """Read title from any supported audio file (MP3, FLAC, etc.) using mutagen's easy interface."""
+    try:
+        audio = mutagen.File(str(p), easy=True)
+        if audio and 'title' in audio:
+            title = audio['title']
+            if isinstance(title, list) and title:
+                return title[0].strip()
+            return str(title).strip()
+    except:
+        pass
+    return None
+
+def clean_tags(p: Path, title: str, artist: str, album: str):
+    try:
+        # Read existing title from metadata before wiping
+        existing_title = get_existing_title(p)
+        final_title = existing_title if existing_title else title
+
         try: tags = ID3(p)
         except ID3NoHeaderError:
             audio = MP3(p); audio.add_tags(); tags = audio.tags
         tags.delete(p, delete_v1=True, delete_v2=True)
         tags = ID3()
-        tags.add(TIT2(encoding=3, text=t)); tags.add(TPE1(encoding=3, text=f))
-        tags.add(TALB(encoding=3, text=f)); tags.add(TRCK(encoding=3, text="1"))
-        tags.add(TDRC(encoding=3, text="2000")); tags.save(p, v2_version=3)
+        tags.add(TIT2(encoding=3, text=final_title))
+        tags.add(TPE1(encoding=3, text=artist))
+        tags.add(TALB(encoding=3, text=album))
+        tags.add(TRCK(encoding=3, text="1"))
+        tags.add(TDRC(encoding=3, text="2000"))
+        tags.save(p, v2_version=3)
     except: pass
+
+def convert_flac_to_mp3(src: Path, dest_dir: Path) -> Path:
+    """Convert a FLAC file to MP3 320kbps using FFmpeg. Returns the output path."""
+    dest = dest_dir / f"{src.stem}.mp3"
+    result = subprocess.run(
+        ['ffmpeg', '-y', '-i', str(src), '-codec:a', 'libmp3lame', '-b:a', '320k',
+         '-write_id3v2', '1', '-id3v2_version', '3', str(dest)],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "FFmpeg error")
+    return dest
 
 # --- ROUTES ---
 
@@ -82,28 +141,6 @@ def ipod_status():
     itunes, ipod = get_ipod()
     res = jsonify({"connected": ipod is not None, "name": ipod.Name if ipod else None, "busy": is_busy})
     pythoncom.CoUninitialize() 
-    return res
-
-@app.route("/api/list-playlists", methods=["POST"])
-def list_playlists():
-    itunes, ipod = get_ipod()
-    if not ipod: 
-        pythoncom.CoUninitialize()
-        return jsonify({"playlists": []})
-    
-    names = []
-    try:
-        for pl in ipod.Playlists:
-            # Kind == 2 signifie que c'est une playlist normale (pas la musique entière)
-            # .SpecialKind == 0 signifie que ce n'est PAS un dossier système (Films, Podcasts, etc.)
-            # Cela fonctionne quelle que soit la langue d'iTunes !
-            if pl.Kind == 2 and pl.SpecialKind == 0:
-                names.append(pl.Name)
-    except:
-        pass
-
-    res = jsonify({"playlists": sorted(list(set(names)))})
-    pythoncom.CoUninitialize()
     return res
 
 @app.route("/api/browse-folder", methods=["POST"])
@@ -120,89 +157,140 @@ def browse_folder():
     except:
         return jsonify({"folder": None})
 
-@app.route("/api/delete-playlist", methods=["POST"])
-def delete_playlist():
-    global is_busy
-    is_busy = True
-    pl_name = request.json.get("playlist")
-    def generate():
-        global is_busy
-        log = lambda m: f"data: {m}\n\n"
-        yield log(f"🗑️ Deep physical purge: {pl_name}")
-        try:
-            itunes, ipod = get_ipod()
-            playlist = next((p for p in ipod.Playlists if p.Name == pl_name), None)
-            if playlist:
-                to_delete = [(t.Name.lower(), t.Artist.lower()) for t in playlist.Tracks]
-                yield log(f"🔥 Deleting {len(to_delete)} files...")
-                lib = next(p for p in ipod.Playlists if p.Kind == 1)
-                deleted = 0
-                for i in range(lib.Tracks.Count, 0, -1):
-                    t = lib.Tracks.Item(i)
-                    if (t.Name.lower(), t.Artist.lower()) in to_delete:
-                        t.Delete(); deleted += 1
-                time.sleep(0.5)
-                playlist.Delete()
-                yield log(f"✅ Completed: {deleted} files removed.")
-            yield log("☑️ DONE ☑️ Playlist deleted 🎵")
-        except Exception as e: yield log(f"❌ Error: {str(e)}")
-        finally: 
-            is_busy = False
-            pythoncom.CoUninitialize()
-    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+@app.route("/api/cancel-sync", methods=["POST"])
+def cancel_sync():
+    """Signal the running sync to stop after the current file."""
+    if is_busy:
+        cancel_event.set()
+        return jsonify({"cancelled": True})
+    return jsonify({"cancelled": False, "error": "No sync in progress"})
 
 @app.route("/api/sync", methods=["POST"])
 def sync():
     global is_busy
     is_busy = True
+    cancel_event.clear()
     data = request.json
     folder = Path(data.get("folder", ""))
     
     def generate():
         global is_busy
         log = lambda m: f"data: {m}\n\n"
-        yield log(f"🚀 Preparing: {folder.name}")
+        yield log(f"🚀 Scanning library: {folder.name}")
+        temp_dir = None
+        cancelled = False
+        ffmpeg_missing = False
         try:
             itunes, ipod = get_ipod()
             if not ipod:
                 yield log("❌ iPod not found.")
                 return
 
-            mp3_files = sorted(folder.glob("*.mp3"))
-            renamed_paths = []
-            
-            for mp3 in mp3_files:
-                new_stem = slugify(mp3.stem)
-                new_path = mp3.parent / f"{new_stem}.mp3"
-                if mp3.name != new_path.name:
-                    mp3.rename(new_path)
-                    yield log(f"  ✏️ {mp3.name} → {new_path.name}")
-                clean_tags(new_path, new_stem, folder.name)
-                renamed_paths.append(new_path)
-            
+            # --- Pre-scan iPod library for duplicate detection ---
+            yield log("🔍 Scanning iPod library for existing tracks...")
             lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
-            playlist = next((p for p in ipod.Playlists if p.Name == folder.name), None)
-            if not playlist: 
-                playlist = itunes.CreatePlaylistInSource(folder.name, ipod)
-            
-            existing_in_lib = {t.Name.lower().strip(): t for t in lib.Tracks}
-            transfers = 0
-            
-            for path in renamed_paths:
-                key = path.stem.lower().strip()
-                if key not in existing_in_lib:
-                    yield log(f"  ✅ Transfer: {path.name}")
-                    lib.AddFile(str(path.resolve()))
-                    time.sleep(0.3)
-                    new_t = next((t for t in lib.Tracks if t.Name.lower().strip() == key), None)
-                    if new_t: 
-                        playlist.AddTrack(new_t)
-                        transfers += 1
-                else:
-                    yield log(f"  🔗 Link created: {path.name}")
-                    playlist.AddTrack(existing_in_lib[key])
+            existing_in_lib = set()
+            for t in lib.Tracks:
+                try:
+                    existing_in_lib.add(t.Name.lower().strip())
+                except:
+                    continue
+            yield log(f"📋 iPod has {len(existing_in_lib)} existing tracks")
 
-            if transfers > 0:
+            # --- Scan source folder for audio files ---
+            audio_files = sorted([f for f in folder.rglob('*') if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS])
+            if not audio_files:
+                yield log("❌ No supported audio files found (.mp3, .flac)")
+                return
+
+            total = len(audio_files)
+            yield log(f"📂 Found {total} audio files")
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="ipodsync_"))
+            transfers = 0
+            skipped = 0
+            errors = 0
+
+            # --- Per-file streaming pipeline: check dupe → convert → tag → transfer ---
+            for idx, audio in enumerate(audio_files, 1):
+                if cancel_event.is_set():
+                    cancelled = True
+                    yield log(f"⏹ Sync cancelled by user after {idx - 1}/{total} files.")
+                    break
+
+                new_stem = slugify(audio.stem)
+                ext = audio.suffix.lower()
+                tag = f"[{idx}/{total}]"
+
+                # Derive artist/album from folder structure
+                relative = audio.relative_to(folder)
+                parts = relative.parts  # e.g. ('Artist', 'Album', 'song.mp3')
+
+                if len(parts) >= 3:
+                    artist_name = strip_year(parts[0])
+                    album_name = strip_year(parts[1])
+                elif len(parts) == 2:
+                    artist_name = strip_year(parts[0])
+                    album_name = strip_year(parts[0])
+                else:
+                    artist_name = strip_year(folder.name)
+                    album_name = strip_year(folder.name)
+
+                # --- Pre-sync duplicate check (before conversion) ---
+                # Check both slugified stem and original metadata title
+                keys_to_check = {new_stem.lower().strip()}
+                source_title = get_source_title(audio)
+                if source_title:
+                    keys_to_check.add(source_title.lower().strip())
+                if keys_to_check & existing_in_lib:
+                    yield log(f"  {tag} 🔗 Already on iPod: {audio.name}")
+                    skipped += 1
+                    continue
+
+                # --- Prepare file in temp directory ---
+                temp_subdir = temp_dir / slugify(artist_name) / slugify(album_name)
+                temp_subdir.mkdir(parents=True, exist_ok=True)
+
+                if ext == '.flac':
+                    if ffmpeg_missing:
+                        continue
+                    # Convert FLAC → MP3 320kbps into temp dir
+                    yield log(f"  {tag} 🔄 Converting: {audio.name} → {new_stem}.mp3 (320kbps)")
+                    try:
+                        mp3_path = convert_flac_to_mp3(audio, temp_subdir)
+                        final_path = temp_subdir / f"{new_stem}.mp3"
+                        if mp3_path != final_path:
+                            mp3_path.rename(final_path)
+                    except FileNotFoundError:
+                        yield log(f"  ❌ FFmpeg not found! Install FFmpeg and add it to PATH to convert FLAC files.")
+                        yield log(f"  ⏭️ Skipping all FLAC files.")
+                        ffmpeg_missing = True
+                        errors += 1
+                        continue
+                    except (RuntimeError, Exception) as e:
+                        yield log(f"  ❌ Conversion failed: {audio.name} — {e}")
+                        errors += 1
+                        continue
+                else:
+                    # MP3 — copy to temp dir (never modify source folder)
+                    final_path = temp_subdir / f"{new_stem}.mp3"
+                    shutil.copy2(str(audio), str(final_path))
+
+                # --- Tag and transfer ---
+                clean_tags(final_path, new_stem, artist_name, album_name)
+
+                if cancel_event.is_set():
+                    cancelled = True
+                    yield log(f"⏹ Sync cancelled by user after {idx}/{total} files.")
+                    break
+
+                yield log(f"  {tag} ✅ Transfer: {final_path.name}  ← {artist_name} / {album_name}")
+                lib.AddFile(str(final_path.resolve()))
+                time.sleep(0.3)
+                transfers += 1
+
+            # --- Finalization ---
+            if transfers > 0 and not cancelled:
                 yield log("💾 Finalizing writes to iPod...")
                 consecutive_errors = 0
                 while True:
@@ -217,18 +305,133 @@ def sync():
                 yield log("⏳ Final stabilization (5s)...")
                 time.sleep(5)
                 yield log("🔌 Operation finished.")
-            
-            yield log("☑️ DONE ☑️ Enjoy your playlist 🎵")
-        except Exception as e: yield log(f"❌ Error: {str(e)}")
+            elif transfers > 0 and cancelled:
+                yield log("💾 Stabilizing iPod after partial sync...")
+                time.sleep(5)
+
+            # --- Summary ---
+            summary_parts = [f"{transfers} synced"]
+            if skipped > 0:
+                summary_parts.append(f"{skipped} already on iPod")
+            if errors > 0:
+                summary_parts.append(f"{errors} error{'s' if errors != 1 else ''}")
+            summary = ", ".join(summary_parts)
+
+            if cancelled:
+                yield log(f"⚠️ CANCELLED — {summary}")
+            else:
+                yield log(f"☑️ DONE ☑️ {summary}. Enjoy your music 🎵")
+        except Exception as e:
+            tb = traceback.format_exc()
+            yield log(f"❌ Error: {str(e)}")
+            for line in tb.strip().splitlines():
+                yield log(f"  📋 {line}")
         finally:
+            if temp_dir and temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            cancel_event.clear()
             is_busy = False
             pythoncom.CoUninitialize()
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
+@app.route("/api/ipod-library", methods=["POST"])
+def ipod_library():
+    """Read all tracks from iPod library, return as Artist->Album->Track tree."""
+    tk_wake()
+    itunes, ipod = get_ipod()
+    if not ipod:
+        pythoncom.CoUninitialize()
+        return jsonify({"connected": False, "library": []})
+
+    tree = {}  # { artist: { album: [track_dicts] } }
+    lib = next((pl for pl in ipod.Playlists if pl.Kind == 1), None)
+    if lib:
+        for i in range(1, lib.Tracks.Count + 1):
+            try:
+                t = lib.Tracks.Item(i)
+                artist = t.Artist or "Unknown Artist"
+                album = t.Album or "Unknown Album"
+                track = {
+                    "name": t.Name or "Untitled",
+                    "trackId": t.TrackDatabaseID,
+                    "duration": t.Duration,
+                    "size": t.Size,
+                }
+                tree.setdefault(artist, {}).setdefault(album, []).append(track)
+            except:
+                continue
+
+    # Convert to sorted array structure for frontend
+    library = []
+    for artist_name in sorted(tree.keys(), key=str.lower):
+        albums = []
+        for album_name in sorted(tree[artist_name].keys(), key=str.lower):
+            tracks = sorted(tree[artist_name][album_name], key=lambda t: t["name"].lower())
+            albums.append({"name": album_name, "tracks": tracks})
+        library.append({"name": artist_name, "albums": albums})
+
+    pythoncom.CoUninitialize()
+    return jsonify({"connected": True, "library": library})
+
+@app.route("/api/delete-tracks", methods=["POST"])
+def delete_tracks():
+    """Delete tracks from iPod by TrackDatabaseID."""
+    global is_busy
+    if is_busy:
+        return jsonify({"success": False, "deleted": 0, "error": "Server is busy"})
+
+    is_busy = True
+    track_ids = set(request.json.get("trackIds", []))
+
+    itunes, ipod = get_ipod()
+    if not ipod:
+        is_busy = False
+        pythoncom.CoUninitialize()
+        return jsonify({"success": False, "deleted": 0, "error": "iPod not found"})
+
+    lib = next((pl for pl in ipod.Playlists if pl.Kind == 1), None)
+    deleted = 0
+    errors = []
+
+    # Iterate in reverse to safely delete by index
+    for i in range(lib.Tracks.Count, 0, -1):
+        try:
+            t = lib.Tracks.Item(i)
+            if t.TrackDatabaseID in track_ids:
+                t.Delete()
+                deleted += 1
+        except Exception as e:
+            errors.append(str(e))
+
+    is_busy = False
+    pythoncom.CoUninitialize()
+    return jsonify({"success": True, "deleted": deleted, "errors": errors})
+
+@app.route("/api/check-ffmpeg", methods=["POST"])
+def check_ffmpeg():
+    """Check if FFmpeg is installed and reachable on PATH."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            # First line of ffmpeg -version contains the version string
+            version_line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "unknown"
+            return jsonify({"installed": True, "version": version_line, "error": None})
+        else:
+            return jsonify({"installed": False, "version": None, "error": "ffmpeg returned a non-zero exit code"})
+    except FileNotFoundError:
+        return jsonify({"installed": False, "version": None, "error": "ffmpeg not found on PATH"})
+    except subprocess.TimeoutExpired:
+        return jsonify({"installed": False, "version": None, "error": "ffmpeg check timed out"})
+    except Exception as e:
+        return jsonify({"installed": False, "version": None, "error": str(e)})
+
 @app.route("/api/list-mp3", methods=["POST"])
 def list_mp3():
     folder = Path(request.json.get("folder", ""))
-    files = list(folder.glob("*.mp3"))
+    files = [f for f in folder.rglob('*') if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS]
     return jsonify({"count": len(files)})
 
 @app.route("/")
