@@ -1,4 +1,5 @@
 import re, sys, os, random, string, subprocess, webbrowser, threading, time, queue, tempfile, shutil, traceback
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
@@ -15,6 +16,7 @@ except ImportError:
     sys.exit(1)
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.flac'}
+CONVERSION_WORKERS = min(os.cpu_count() or 4, 4)  # Max parallel FFmpeg processes
 
 app = Flask(__name__)
 is_busy = False # Server global lock
@@ -133,6 +135,75 @@ def convert_flac_to_mp3(src: Path, dest_dir: Path) -> Path:
         raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "FFmpeg error")
     return dest
 
+def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: threading.Event, ffmpeg_ok: threading.Event):
+    """Worker function: prepare a single audio file for iPod transfer.
+    Converts FLAC→MP3 or copies MP3 to temp dir, then applies ID3 tags.
+    Runs in a thread pool — must NOT touch COM objects.
+    Returns a result dict with file info or error details.
+    """
+    new_stem = slugify(audio.stem)
+    ext = audio.suffix.lower()
+
+    # Derive artist/album from folder structure
+    relative = audio.relative_to(folder)
+    parts = relative.parts  # e.g. ('Artist', 'Album', 'song.mp3')
+
+    if len(parts) >= 3:
+        artist_name = strip_year(parts[0])
+        album_name = strip_year(parts[1])
+    elif len(parts) == 2:
+        artist_name = strip_year(parts[0])
+        album_name = strip_year(parts[0])
+    else:
+        artist_name = strip_year(folder.name)
+        album_name = strip_year(folder.name)
+
+    result = {
+        "audio": audio,
+        "artist": artist_name,
+        "album": album_name,
+        "new_stem": new_stem,
+        "final_path": None,
+        "error": None,
+        "ffmpeg_missing": False,
+    }
+
+    # Bail early if cancelled
+    if cancel_event.is_set():
+        result["error"] = "cancelled"
+        return result
+
+    temp_subdir = temp_dir / slugify(artist_name) / slugify(album_name)
+    temp_subdir.mkdir(parents=True, exist_ok=True)
+
+    if ext == '.flac':
+        if not ffmpeg_ok.is_set():
+            result["error"] = "ffmpeg_missing"
+            result["ffmpeg_missing"] = True
+            return result
+        try:
+            mp3_path = convert_flac_to_mp3(audio, temp_subdir)
+            final_path = temp_subdir / f"{new_stem}.mp3"
+            if mp3_path != final_path:
+                mp3_path.rename(final_path)
+        except FileNotFoundError:
+            ffmpeg_ok.clear()  # Signal all other workers to skip FLACs
+            result["error"] = "ffmpeg_not_found"
+            result["ffmpeg_missing"] = True
+            return result
+        except (RuntimeError, Exception) as e:
+            result["error"] = str(e)
+            return result
+    else:
+        # MP3 — copy to temp dir (never modify source folder)
+        final_path = temp_subdir / f"{new_stem}.mp3"
+        shutil.copy2(str(audio), str(final_path))
+
+    # Tag the file (mutagen, no COM)
+    clean_tags(final_path, new_stem, artist_name, album_name)
+    result["final_path"] = final_path
+    return result
+
 # --- ROUTES ---
 
 @app.route("/api/ipod-status", methods=["POST"])
@@ -179,7 +250,6 @@ def sync():
         yield log(f"🚀 Scanning library: {folder.name}")
         temp_dir = None
         cancelled = False
-        ffmpeg_missing = False
         try:
             itunes, ipod = get_ipod()
             if not ipod:
@@ -211,33 +281,11 @@ def sync():
             skipped = 0
             errors = 0
 
-            # --- Per-file streaming pipeline: check dupe → convert → tag → transfer ---
+            # --- Pre-sync duplicate check (before conversion) ---
+            files_to_process = []  # (original_idx, audio) tuples for non-duplicate files
             for idx, audio in enumerate(audio_files, 1):
-                if cancel_event.is_set():
-                    cancelled = True
-                    yield log(f"⏹ Sync cancelled by user after {idx - 1}/{total} files.")
-                    break
-
                 new_stem = slugify(audio.stem)
-                ext = audio.suffix.lower()
                 tag = f"[{idx}/{total}]"
-
-                # Derive artist/album from folder structure
-                relative = audio.relative_to(folder)
-                parts = relative.parts  # e.g. ('Artist', 'Album', 'song.mp3')
-
-                if len(parts) >= 3:
-                    artist_name = strip_year(parts[0])
-                    album_name = strip_year(parts[1])
-                elif len(parts) == 2:
-                    artist_name = strip_year(parts[0])
-                    album_name = strip_year(parts[0])
-                else:
-                    artist_name = strip_year(folder.name)
-                    album_name = strip_year(folder.name)
-
-                # --- Pre-sync duplicate check (before conversion) ---
-                # Check both slugified stem and original metadata title
                 keys_to_check = {new_stem.lower().strip()}
                 source_title = get_source_title(audio)
                 if source_title:
@@ -245,49 +293,77 @@ def sync():
                 if keys_to_check & existing_in_lib:
                     yield log(f"  {tag} 🔗 Already on iPod: {audio.name}")
                     skipped += 1
-                    continue
-
-                # --- Prepare file in temp directory ---
-                temp_subdir = temp_dir / slugify(artist_name) / slugify(album_name)
-                temp_subdir.mkdir(parents=True, exist_ok=True)
-
-                if ext == '.flac':
-                    if ffmpeg_missing:
-                        continue
-                    # Convert FLAC → MP3 320kbps into temp dir
-                    yield log(f"  {tag} 🔄 Converting: {audio.name} → {new_stem}.mp3 (320kbps)")
-                    try:
-                        mp3_path = convert_flac_to_mp3(audio, temp_subdir)
-                        final_path = temp_subdir / f"{new_stem}.mp3"
-                        if mp3_path != final_path:
-                            mp3_path.rename(final_path)
-                    except FileNotFoundError:
-                        yield log(f"  ❌ FFmpeg not found! Install FFmpeg and add it to PATH to convert FLAC files.")
-                        yield log(f"  ⏭️ Skipping all FLAC files.")
-                        ffmpeg_missing = True
-                        errors += 1
-                        continue
-                    except (RuntimeError, Exception) as e:
-                        yield log(f"  ❌ Conversion failed: {audio.name} — {e}")
-                        errors += 1
-                        continue
                 else:
-                    # MP3 — copy to temp dir (never modify source folder)
-                    final_path = temp_subdir / f"{new_stem}.mp3"
-                    shutil.copy2(str(audio), str(final_path))
+                    files_to_process.append((idx, audio))
 
-                # --- Tag and transfer ---
-                clean_tags(final_path, new_stem, artist_name, album_name)
+            if not files_to_process:
+                yield log("✅ All files already on iPod, nothing to sync.")
 
-                if cancel_event.is_set():
-                    cancelled = True
-                    yield log(f"⏹ Sync cancelled by user after {idx}/{total} files.")
-                    break
+            # --- Multi-threaded conversion + serial transfer pipeline ---
+            if files_to_process:
+                ffmpeg_ok = threading.Event()
+                ffmpeg_ok.set()  # Assume FFmpeg is available until proven otherwise
+                yield log(f"⚡ Starting conversion pipeline ({CONVERSION_WORKERS} workers, {len(files_to_process)} files)...")
 
-                yield log(f"  {tag} ✅ Transfer: {final_path.name}  ← {artist_name} / {album_name}")
-                lib.AddFile(str(final_path.resolve()))
-                time.sleep(0.3)
-                transfers += 1
+                with ThreadPoolExecutor(max_workers=CONVERSION_WORKERS) as executor:
+                    # Submit all files for parallel preparation
+                    future_list = []  # [(future, idx, audio), ...] — maintains submission order
+                    for idx, audio in files_to_process:
+                        future = executor.submit(prepare_file, audio, temp_dir, folder, cancel_event, ffmpeg_ok)
+                        future_list.append((future, idx, audio))
+
+                    # Consume results in order — blocks on each future until ready
+                    ffmpeg_error_logged = False
+                    for future, idx, audio in future_list:
+                        if cancel_event.is_set():
+                            cancelled = True
+                            yield log(f"⏹ Sync cancelled by user at file {idx}/{total}.")
+                            # Cancel remaining pending futures
+                            for f, _, _ in future_list:
+                                f.cancel()
+                            break
+
+                        tag = f"[{idx}/{total}]"
+                        try:
+                            result = future.result()  # Blocks until this file's prep is done
+                        except Exception as e:
+                            yield log(f"  {tag} ❌ Unexpected error preparing: {audio.name} — {e}")
+                            errors += 1
+                            continue
+
+                        # Handle worker errors
+                        if result["error"]:
+                            if result["error"] == "cancelled":
+                                cancelled = True
+                                break
+                            elif result["ffmpeg_missing"] and not ffmpeg_error_logged:
+                                yield log(f"  ❌ FFmpeg not found! Install FFmpeg and add it to PATH to convert FLAC files.")
+                                yield log(f"  ⏭️ Skipping all FLAC files.")
+                                ffmpeg_error_logged = True
+                                errors += 1
+                                continue
+                            elif result["ffmpeg_missing"]:
+                                # Already logged the FFmpeg error, silently skip
+                                continue
+                            else:
+                                yield log(f"  {tag} ❌ Conversion failed: {audio.name} — {result['error']}")
+                                errors += 1
+                                continue
+
+                        # --- Transfer to iPod on main thread (COM) ---
+                        final_path = result["final_path"]
+                        artist_name = result["artist"]
+                        album_name = result["album"]
+
+                        if cancel_event.is_set():
+                            cancelled = True
+                            yield log(f"⏹ Sync cancelled by user at file {idx}/{total}.")
+                            break
+
+                        yield log(f"  {tag} ✅ Transfer: {final_path.name}  ← {artist_name} / {album_name}")
+                        lib.AddFile(str(final_path.resolve()))
+                        time.sleep(0.3)
+                        transfers += 1
 
             # --- Finalization ---
             if transfers > 0 and not cancelled:
