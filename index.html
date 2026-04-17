@@ -26,6 +26,16 @@
     .setting-select { flex: 1; background: #000; color: var(--accent); border: 1px solid var(--border); border-radius: 5px; padding: 8px 10px; font-family: 'Share Tech Mono'; font-size: 12px; cursor: pointer; appearance: none; -webkit-appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2300e5ff'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 28px; }
     .setting-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 6px rgba(0,229,255,0.15); }
     .setting-select option { background: #0d0d14; color: var(--text); }
+    .art-info { font-family: 'Share Tech Mono'; font-size: 11px; color: #555; padding: 4px 0 2px 0; letter-spacing: 0.5px; transition: color 0.2s ease; }
+    .art-info.active { color: var(--accent); }
+    .art-info.disabled { color: #555; }
+    /* Checkbox toggle */
+    .setting-check { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+    .setting-check input[type="checkbox"] { display: none; }
+    .check-box { width: 16px; height: 16px; border: 2px solid #333; border-radius: 3px; display: flex; align-items: center; justify-content: center; transition: all 0.2s ease; flex-shrink: 0; }
+    .setting-check input:checked + .check-box { background: var(--accent); border-color: var(--accent); }
+    .setting-check input:checked + .check-box::after { content: '✓'; font-size: 11px; color: #000; font-weight: bold; }
+    .setting-check:hover .check-box { border-color: var(--accent); }
 
     /* --- Tab Bar --- */
     .tab-bar { display: flex; gap: 0; margin-bottom: 0; flex-shrink: 0; }
@@ -112,7 +122,26 @@
             <span class="card-label">01 / DEVICE</span>
             <div class="ipod-bar"><div id="ipod-dot" class="dot"></div> <span id="ipod-label">Checking...</span></div>
             <div class="ipod-bar"><div id="ffmpeg-dot" class="dot"></div> <span id="ffmpeg-label">FFmpeg: checking...</span></div>
-            <div class="path-box" id="path-box">--- NO FOLDER ---</div>
+            <div class="setting-row" style="margin-top:8px;">
+                <span class="setting-label">DEVICE</span>
+                <select id="device-select" class="setting-select" onchange="onDeviceChange()">
+                    <option value="nano">iPod Nano</option>
+                    <option value="mini">iPod Mini</option>
+                    <option value="5gen" selected>iPod 5th / 5.5th Gen</option>
+                    <option value="classic">iPod Classic</option>
+                    <option value="4gen-mono">iPod 4th Gen (Mono)</option>
+                    <option value="4gen-color">iPod 4th Gen (Color)</option>
+                </select>
+            </div>
+            <div id="art-info" class="art-info active">🎨 Album art: 500×500px</div>
+            <div class="setting-row" style="margin-top:4px; margin-bottom:0;">
+                <label class="setting-check" id="art-toggle-label">
+                    <input type="checkbox" id="art-toggle" checked onchange="onArtToggle()">
+                    <div class="check-box"></div>
+                    <span class="setting-label" style="margin:0;">EMBED ART</span>
+                </label>
+            </div>
+            <div class="path-box" id="path-box" style="margin-top:8px;">--- NO FOLDER ---</div>
             <button class="btn" id="btn-browse" onclick="pickFolder()" style="margin-top:10px;">BROWSE FOLDER</button>
         </div>
 
@@ -184,6 +213,62 @@
     let isBusy       = false;
     let libraryData  = [];       // Raw library JSON from API
     let trackMap     = new Map(); // trackId -> full track object (for future metadata editor)
+
+    // ─── Device Profiles ──────────────────────────────────────────
+    const DEVICE_PROFILES = {
+        'nano':       { name: 'iPod Nano',              artSize: 320,  artSupport: true,  bitrate: '256' },
+        'mini':       { name: 'iPod Mini',              artSize: 0,    artSupport: false, bitrate: '192' },
+        '5gen':       { name: 'iPod 5th / 5.5th Gen',   artSize: 500,  artSupport: true,  bitrate: '320' },
+        'classic':    { name: 'iPod Classic',            artSize: 500,  artSupport: true,  bitrate: '320' },
+        '4gen-mono':  { name: 'iPod 4th Gen (Mono)',     artSize: 0,    artSupport: false, bitrate: '192' },
+        '4gen-color': { name: 'iPod 4th Gen (Color)',    artSize: 400,  artSupport: true,  bitrate: '256' },
+    };
+
+    function onDeviceChange() {
+        const device = document.getElementById('device-select').value;
+        const profile = DEVICE_PROFILES[device];
+        if (!profile) return;
+
+        // Auto-set recommended bitrate
+        const bitrateSelect = document.getElementById('bitrate-select');
+        bitrateSelect.value = profile.bitrate;
+
+        // Update album art info and toggle
+        const artInfo = document.getElementById('art-info');
+        const artToggle = document.getElementById('art-toggle');
+        const artLabel = document.getElementById('art-toggle-label');
+
+        if (profile.artSupport) {
+            artToggle.checked = true;
+            artToggle.disabled = false;
+            artLabel.style.opacity = '1';
+            artLabel.style.pointerEvents = 'auto';
+            artInfo.className = 'art-info active';
+            artInfo.textContent = `🎨 Album art: ${profile.artSize}×${profile.artSize}px`;
+        } else {
+            artToggle.checked = false;
+            artToggle.disabled = true;
+            artLabel.style.opacity = '0.4';
+            artLabel.style.pointerEvents = 'none';
+            artInfo.className = 'art-info disabled';
+            artInfo.textContent = '🚫 Album art: disabled (mono display)';
+        }
+    }
+
+    function onArtToggle() {
+        const device = document.getElementById('device-select').value;
+        const profile = DEVICE_PROFILES[device];
+        const artInfo = document.getElementById('art-info');
+        const checked = document.getElementById('art-toggle').checked;
+
+        if (checked && profile.artSupport) {
+            artInfo.className = 'art-info active';
+            artInfo.textContent = `🎨 Album art: ${profile.artSize}×${profile.artSize}px`;
+        } else {
+            artInfo.className = 'art-info disabled';
+            artInfo.textContent = checked ? `🎨 Album art: ${profile.artSize}×${profile.artSize}px` : '🚫 Album art: disabled';
+        }
+    }
 
     // ─── UI Lock ───────────────────────────────────────────────
     function lockUI() {
@@ -303,7 +388,9 @@
         btn.onclick = cancelSync;
 
         const bitrate = document.getElementById('bitrate-select').value;
-        await executeStream('/api/sync', {folder: selectedPath, bitrate: parseInt(bitrate)});
+        const device = document.getElementById('device-select').value;
+        const embedArt = document.getElementById('art-toggle').checked;
+        await executeStream('/api/sync', {folder: selectedPath, bitrate: parseInt(bitrate), device: device, embed_art: embedArt});
 
         // Revert button
         btn.textContent = 'LAUNCH SYNC';
@@ -643,6 +730,7 @@
     }
 
     // ─── Init ──────────────────────────────────────────────────
+    onDeviceChange(); // Set initial profile state
     checkIpod();
     checkFfmpeg();
 </script>

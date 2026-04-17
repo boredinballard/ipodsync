@@ -20,7 +20,17 @@ except ImportError:
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.flac'}
 CONVERSION_WORKERS = min(os.cpu_count() or 4, 4)  # Max parallel FFmpeg processes
-ALBUM_ART_SIZE = (500, 500)  # Target album art dimensions in px (optimized for iPod)
+ALBUM_ART_SIZE = (500, 500)  # Target album art dimensions in px (fallback default)
+
+# Device-specific profiles: art_size is (w,h) or None to skip art embedding
+DEVICE_PROFILES = {
+    'nano':       {'name': 'iPod Nano',            'art_size': (320, 320)},
+    'mini':       {'name': 'iPod Mini',            'art_size': None},       # Mono screen
+    '5gen':       {'name': 'iPod 5th / 5.5th Gen', 'art_size': (500, 500)},
+    'classic':    {'name': 'iPod Classic',          'art_size': (500, 500)},
+    '4gen-mono':  {'name': 'iPod 4th Gen (Mono)',   'art_size': None},       # Mono screen
+    '4gen-color': {'name': 'iPod 4th Gen (Color)',  'art_size': (400, 400)},
+}
 
 app = Flask(__name__)
 is_busy = False # Server global lock
@@ -188,11 +198,12 @@ def convert_flac_to_mp3(src: Path, dest_dir: Path, bitrate: int = 320) -> Path:
         raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "FFmpeg error")
     return dest
 
-def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: threading.Event, ffmpeg_ok: threading.Event, bitrate: int = 320):
+def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: threading.Event, ffmpeg_ok: threading.Event, bitrate: int = 320, art_size: tuple = ALBUM_ART_SIZE):
     """Worker function: prepare a single audio file for iPod transfer.
     Converts FLAC→MP3 or copies MP3 to temp dir, then applies ID3 tags.
     Runs in a thread pool — must NOT touch COM objects.
     Returns a result dict with file info or error details.
+    art_size: target album art dimensions, or None to skip art embedding.
     """
     new_stem = slugify(audio.stem)
     ext = audio.suffix.lower()
@@ -214,9 +225,11 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
     # Read the track number from source before any conversion
     track_number = get_source_track_number(audio)
 
-    # Extract and resize album art from source before conversion
-    raw_art = extract_album_art(audio)
-    artwork_data = resize_album_art(raw_art) if raw_art else None
+    # Extract and resize album art from source before conversion (skip if art_size is None)
+    artwork_data = None
+    if art_size is not None:
+        raw_art = extract_album_art(audio)
+        artwork_data = resize_album_art(raw_art, size=art_size) if raw_art else None
 
     result = {
         "audio": audio,
@@ -304,10 +317,18 @@ def sync():
     data = request.json
     folder = Path(data.get("folder", ""))
     bitrate = data.get("bitrate", 320)
+    device_key = data.get("device", "5gen")
+    embed_art = data.get("embed_art", True)
     
+    # Resolve device profile for art sizing
+    device_profile = DEVICE_PROFILES.get(device_key, DEVICE_PROFILES['5gen'])
+    art_size = device_profile['art_size'] if embed_art else None
+
     def generate():
         global is_busy
         log = lambda m: f"data: {m}\n\n"
+        art_label = f"{art_size[0]}×{art_size[1]}px" if art_size else "disabled"
+        yield log(f"🎨 Device: {device_profile['name']} | Art: {art_label} | Bitrate: {bitrate}kbps")
         yield log(f"🚀 Scanning library: {folder.name}")
         temp_dir = None
         cancelled = False
@@ -341,6 +362,7 @@ def sync():
             transfers = 0
             skipped = 0
             errors = 0
+            pending_ops = []  # IITOperationStatus objects from AddFile()
 
             # --- Pre-sync duplicate check (before conversion) ---
             files_to_process = []  # (original_idx, audio) tuples for non-duplicate files
@@ -370,7 +392,7 @@ def sync():
                     # Submit all files for parallel preparation
                     future_list = []  # [(future, idx, audio), ...] — maintains submission order
                     for idx, audio in files_to_process:
-                        future = executor.submit(prepare_file, audio, temp_dir, folder, cancel_event, ffmpeg_ok, bitrate)
+                        future = executor.submit(prepare_file, audio, temp_dir, folder, cancel_event, ffmpeg_ok, bitrate, art_size)
                         future_list.append((future, idx, audio))
 
                     # Consume results in order — blocks on each future until ready
@@ -422,29 +444,73 @@ def sync():
                             break
 
                         yield log(f"  {tag} ✅ Transfer: {final_path.name}  ← {artist_name} / {album_name}")
-                        lib.AddFile(str(final_path.resolve()))
+                        op_status = lib.AddFile(str(final_path.resolve()))
+                        if op_status is not None:
+                            pending_ops.append((op_status, final_path.name))
                         time.sleep(0.3)
                         transfers += 1
 
-            # --- Finalization ---
-            if transfers > 0 and not cancelled:
-                yield log("💾 Finalizing writes to iPod...")
-                consecutive_errors = 0
-                while True:
-                    try:
-                        if itunes.LibraryUpdateStatus == 0: break
-                    except:
-                        consecutive_errors += 1
-                        if consecutive_errors > 10: break
-                    time.sleep(5)
-                    yield log("⏳ Syncing in progress...")
+            # --- Finalization: Wait for iPod transfer to complete ---
+            # AddFile() returns an IITOperationStatus whose .InProgress
+            # property is True while iTunes is still copying the file to
+            # the iPod.  We poll every pending operation until all have
+            # finished, keeping the temp directory (source files) and the
+            # COM connection alive the entire time.
+            if transfers > 0 and pending_ops and not cancelled:
+                yield log(f"💾 Finalizing — waiting for {len(pending_ops)} iPod transfers to complete...")
 
-                yield log("⏳ Final stabilization (5s)...")
-                time.sleep(5)
-                yield log("🔌 Operation finished.")
+                POLL_INTERVAL = 3        # seconds between checks
+                MAX_WAIT = 3600          # 1-hour safety timeout
+                elapsed = 0
+
+                while elapsed < MAX_WAIT and pending_ops:
+                    time.sleep(POLL_INTERVAL)
+                    elapsed += POLL_INTERVAL
+
+                    # Filter out completed operations
+                    still_pending = []
+                    for op, name in pending_ops:
+                        try:
+                            if op.InProgress:
+                                still_pending.append((op, name))
+                        except:
+                            pass  # COM error — treat as complete
+                    pending_ops = still_pending
+
+                    # Log progress every ~15 s
+                    if elapsed % 15 == 0 and pending_ops:
+                        yield log(f"⏳ {len(pending_ops)} transfers still in progress... ({elapsed}s elapsed)")
+
+                if elapsed >= MAX_WAIT and pending_ops:
+                    yield log(f"⚠️ Transfer wait timed out — {len(pending_ops)} ops still pending.")
+                else:
+                    yield log("🔌 All transfers complete.")
+
+            elif transfers > 0 and not cancelled:
+                # AddFile didn't return status objects — brief fallback wait
+                yield log("💾 Finalizing (no operation status available)...")
+                time.sleep(15)
+                yield log("🔌 Done.")
+
             elif transfers > 0 and cancelled:
+                # Give in-flight transfers a chance to finish
                 yield log("💾 Stabilizing iPod after partial sync...")
-                time.sleep(5)
+                POLL_INTERVAL = 3
+                MAX_WAIT = 300
+                elapsed = 0
+                while elapsed < MAX_WAIT and pending_ops:
+                    time.sleep(POLL_INTERVAL)
+                    elapsed += POLL_INTERVAL
+                    still_pending = []
+                    for op, n in pending_ops:
+                        try:
+                            if op.InProgress:
+                                still_pending.append((op, n))
+                        except:
+                            pass
+                    pending_ops = still_pending
+                    if elapsed % 15 == 0 and pending_ops:
+                        yield log(f"⏳ Stabilizing — {len(pending_ops)} ops pending ({elapsed}s)")
 
             # --- Summary ---
             summary_parts = [f"{transfers} synced"]

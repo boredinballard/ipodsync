@@ -17,6 +17,7 @@
 - [x] **Pre-Sync Duplicate Check** — Before converting or transferring anything, compare the source folder against the iPod's existing library. Skip files that already exist on the device *before* running FFmpeg conversion, avoiding wasted time re-converting FLACs that are already synced. Currently, duplicates are only detected after conversion.
 - [x] **Streaming Convert + Transfer Pipeline** — Instead of converting all FLACs first and then transferring all MP3s, process each file end-to-end (convert → tag → transfer) before moving on to the next. This overlaps conversion and transfer work and means the iPod starts receiving music immediately rather than waiting for the entire batch to finish converting.
 - [x] **Multi-Threaded FLAC Conversion** — Convert up to 4 FLAC files simultaneously using a thread pool (`ThreadPoolExecutor`) while transferring completed files to the iPod on the main thread. Conversion and transfer are fully overlapped — the next batch of files is already converting while the current file transfers.
+- [x] **Device-Specific Settings** — Album art dimensions, art embedding toggle, and recommended bitrate auto-adjust based on the selected iPod model (Nano, Mini, 5th/5.5th Gen, Classic, 4th Gen Mono/Color). Mono devices skip art embedding entirely for faster syncs and smaller files.
 
 ### Backlog
 - [ ] **Selective Sync** — After browsing a folder, show a preview tree of what will be synced and let the user check/uncheck specific artists, albums, or tracks before syncing.
@@ -37,6 +38,7 @@
 
 ## 🖥️ UI / UX Polish
 
+- [x] **Device Type Selector** — Selectable iPod model (Nano, Mini, 5th/5.5th Gen, Classic, 4th Gen Mono/Color) in the device card. Used to tailor sync behavior (art sizing, format constraints, capacity limits) per device.
 - [ ] **Dark/Light Theme Toggle** — Add a theme switcher (current dark theme is default).
 - [ ] **Responsive Layout** — Make the UI usable on smaller screens / tablet browsers.
 - [ ] **Keyboard Shortcuts** — `Ctrl+R` to refresh library, `Delete` to remove selected, `Tab` to switch panels, etc.
