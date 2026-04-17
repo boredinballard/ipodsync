@@ -156,6 +156,18 @@
                     <option value="320" selected>320 kbps</option>
                 </select>
             </div>
+            <div class="setting-row">
+                <span class="setting-label">THREADS</span>
+                <select id="threads-select" class="setting-select">
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="4">4</option>
+                    <option value="6" selected>6</option>
+                    <option value="8">8</option>
+                    <option value="12">12</option>
+                    <option value="16">16</option>
+                </select>
+            </div>
             <button id="sync-btn" class="btn" onclick="startSync()" disabled>LAUNCH SYNC</button>
         </div>
 
@@ -388,9 +400,10 @@
         btn.onclick = cancelSync;
 
         const bitrate = document.getElementById('bitrate-select').value;
+        const workers = document.getElementById('threads-select').value;
         const device = document.getElementById('device-select').value;
         const embedArt = document.getElementById('art-toggle').checked;
-        await executeStream('/api/sync', {folder: selectedPath, bitrate: parseInt(bitrate), device: device, embed_art: embedArt});
+        await executeStream('/api/sync', {folder: selectedPath, bitrate: parseInt(bitrate), workers: parseInt(workers), device: device, embed_art: embedArt});
 
         // Revert button
         btn.textContent = 'LAUNCH SYNC';

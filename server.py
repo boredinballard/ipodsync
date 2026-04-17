@@ -19,7 +19,7 @@ except ImportError:
     sys.exit(1)
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.flac'}
-CONVERSION_WORKERS = min(os.cpu_count() or 4, 4)  # Max parallel FFmpeg processes
+CONVERSION_WORKERS = min(os.cpu_count() or 6, 6)  # Default parallel FFmpeg processes
 ALBUM_ART_SIZE = (500, 500)  # Target album art dimensions in px (fallback default)
 
 # Device-specific profiles: art_size is (w,h) or None to skip art embedding
@@ -145,7 +145,17 @@ def get_source_year(p: Path) -> str:
     return None
 
 def extract_album_art(p: Path) -> bytes | None:
-    """Extract embedded album art from a FLAC or MP3 file."""
+    """Extract album art from the folder (cover.jpg/folder.jpg) or embedded in a FLAC/MP3 file."""
+    # 1. Check parent folder for images first
+    for img_name in ['cover.jpg', 'folder.jpg', 'cover.png', 'folder.png', 'front.jpg']:
+        img_path = p.parent / img_name
+        if img_path.is_file():
+            try:
+                return img_path.read_bytes()
+            except Exception:
+                pass
+
+    # 2. Fall back to embedded metadata artwork
     ext = p.suffix.lower()
     try:
         if ext == '.flac':
@@ -331,6 +341,7 @@ def sync():
     data = request.json
     folder = Path(data.get("folder", ""))
     bitrate = data.get("bitrate", 320)
+    workers = max(1, min(16, int(data.get("workers", CONVERSION_WORKERS))))  # Clamp 1-16
     device_key = data.get("device", "5gen")
     embed_art = data.get("embed_art", True)
     
@@ -400,9 +411,9 @@ def sync():
             if files_to_process:
                 ffmpeg_ok = threading.Event()
                 ffmpeg_ok.set()  # Assume FFmpeg is available until proven otherwise
-                yield log(f"⚡ Starting conversion pipeline ({CONVERSION_WORKERS} workers, {len(files_to_process)} files, {bitrate}kbps)...")
+                yield log(f"⚡ Starting conversion pipeline ({workers} workers, {len(files_to_process)} files, {bitrate}kbps)...")
 
-                with ThreadPoolExecutor(max_workers=CONVERSION_WORKERS) as executor:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
                     # Submit all files for parallel preparation
                     future_list = []  # [(future, idx, audio), ...] — maintains submission order
                     for idx, audio in files_to_process:
