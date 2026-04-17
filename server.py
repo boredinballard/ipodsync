@@ -131,6 +131,19 @@ def get_source_track_number(p: Path) -> str:
         pass
     return None
 
+def get_source_year(p: Path) -> str:
+    """Read year/date from any supported audio file using mutagen's easy interface."""
+    try:
+        audio = mutagen.File(str(p), easy=True)
+        if audio and 'date' in audio:
+            date = audio['date']
+            if isinstance(date, list) and date:
+                return date[0].strip()[:4]
+            return str(date).strip()[:4]
+    except:
+        pass
+    return None
+
 def extract_album_art(p: Path) -> bytes | None:
     """Extract embedded album art from a FLAC or MP3 file."""
     ext = p.suffix.lower()
@@ -158,7 +171,7 @@ def resize_album_art(image_data: bytes, size: tuple = ALBUM_ART_SIZE) -> bytes:
     img.save(buf, format='JPEG', quality=90)
     return buf.getvalue()
 
-def clean_tags(p: Path, title: str, artist: str, album: str, track_number: str = None, artwork_data: bytes = None):
+def clean_tags(p: Path, title: str, artist: str, album: str, track_number: str = None, artwork_data: bytes = None, year: str = None):
     try:
         # Read existing title from metadata before wiping
         existing_title = get_existing_title(p)
@@ -173,7 +186,7 @@ def clean_tags(p: Path, title: str, artist: str, album: str, track_number: str =
         tags.add(TPE1(encoding=3, text=artist))
         tags.add(TALB(encoding=3, text=album))
         tags.add(TRCK(encoding=3, text=track_number if track_number else "1"))
-        tags.add(TDRC(encoding=3, text="2000"))
+        tags.add(TDRC(encoding=3, text=year if year else "2000"))
         # Embed album art if available
         if artwork_data:
             tags.add(APIC(
@@ -222,8 +235,9 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
         artist_name = strip_year(folder.name)
         album_name = strip_year(folder.name)
 
-    # Read the track number from source before any conversion
+    # Read the track number and year from source before any conversion
     track_number = get_source_track_number(audio)
+    year = get_source_year(audio)
 
     # Extract and resize album art from source before conversion (skip if art_size is None)
     artwork_data = None
@@ -273,7 +287,7 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
         shutil.copy2(str(audio), str(final_path))
 
     # Tag the file (mutagen, no COM) — preserve original track number and album art
-    clean_tags(final_path, new_stem, artist_name, album_name, track_number, artwork_data)
+    clean_tags(final_path, new_stem, artist_name, album_name, track_number, artwork_data, year)
     result["final_path"] = final_path
     return result
 
@@ -397,7 +411,8 @@ def sync():
 
                     # Consume results in order — blocks on each future until ready
                     ffmpeg_error_logged = False
-                    for future, idx, audio in future_list:
+                    process_total = len(files_to_process)
+                    for process_idx, (future, idx, audio) in enumerate(future_list, 1):
                         if cancel_event.is_set():
                             cancelled = True
                             yield log(f"⏹ Sync cancelled by user at file {idx}/{total}.")
@@ -406,7 +421,7 @@ def sync():
                                 f.cancel()
                             break
 
-                        tag = f"[{idx}/{total}]"
+                        tag = f"[{process_idx}/{process_total}]"
                         try:
                             result = future.result()  # Blocks until this file's prep is done
                         except Exception as e:
@@ -558,6 +573,7 @@ def ipod_library():
                     "name": t.Name or "Untitled",
                     "trackId": t.TrackDatabaseID,
                     "trackNumber": t.TrackNumber or 0,
+                    "year": t.Year or 0,
                     "duration": t.Duration,
                     "size": t.Size,
                 }
@@ -569,9 +585,13 @@ def ipod_library():
     library = []
     for artist_name in sorted(tree.keys(), key=str.lower):
         albums = []
-        for album_name in sorted(tree[artist_name].keys(), key=str.lower):
+        for album_name in tree[artist_name]:
             tracks = sorted(tree[artist_name][album_name], key=lambda t: (t["trackNumber"], t["name"].lower()))
-            albums.append({"name": album_name, "tracks": tracks})
+            # Use earliest non-zero year from tracks as album year
+            album_year = min((t["year"] for t in tracks if t["year"]), default=0)
+            albums.append({"name": album_name, "year": album_year, "tracks": tracks})
+        # Sort albums by year (0 = unknown goes last), then alphabetically
+        albums.sort(key=lambda a: (a["year"] == 0, a["year"], a["name"].lower()))
         library.append({"name": artist_name, "albums": albums})
 
     pythoncom.CoUninitialize()

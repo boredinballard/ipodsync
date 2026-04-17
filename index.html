@@ -502,7 +502,8 @@
             const artistNode = createNode('artist', artist.name, artistTrackCount);
 
             artist.albums.forEach(album => {
-                const albumNode = createNode('album', album.name, album.tracks.length);
+                const albumLabel = album.year ? `${album.name} (${album.year})` : album.name;
+                const albumNode = createNode('album', albumLabel, album.tracks.length);
 
                 album.tracks.forEach(track => {
                     const displayName = track.trackNumber ? `${track.trackNumber}. ${track.name}` : track.name;
