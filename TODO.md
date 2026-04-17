@@ -30,8 +30,8 @@
 ## 🔊 Audio & Format Support
 
 - [ ] **AAC/M4A Support** — Extend supported formats beyond MP3 and FLAC.
-- [ ] **Configurable Bitrate** — Let the user choose MP3 bitrate for FLAC conversion (128, 192, 256, 320 kbps) instead of hardcoded 320.
-- [ ] **Preserve Album Art During Conversion** — Ensure FFmpeg carries over embedded cover art from FLAC to MP3.
+- [x] **Configurable Bitrate** — Let the user choose MP3 bitrate for FLAC conversion (128, 192, 256, 320 kbps) instead of hardcoded 320.
+- [x] **Preserve Album Art During Conversion** — Ensure FFmpeg carries over embedded cover art from FLAC to MP3. Artwork is extracted from source files (FLAC/MP3), resized to 500×500px for iPod, and re-embedded as an APIC frame.
 
 ---
 

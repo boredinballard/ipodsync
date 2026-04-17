@@ -10,13 +10,17 @@ try:
     import pythoncom
     import mutagen
     from mutagen.mp3 import MP3
-    from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, TDRC, ID3NoHeaderError
+    from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, TDRC, APIC, ID3NoHeaderError
+    from mutagen.flac import FLAC
+    from PIL import Image
+    import io
 except ImportError:
-    print("❌ Missing dependencies: pip install flask pywin32 mutagen")
+    print("❌ Missing dependencies: pip install flask pywin32 mutagen Pillow")
     sys.exit(1)
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.flac'}
 CONVERSION_WORKERS = min(os.cpu_count() or 4, 4)  # Max parallel FFmpeg processes
+ALBUM_ART_SIZE = (500, 500)  # Target album art dimensions in px (optimized for iPod)
 
 app = Flask(__name__)
 is_busy = False # Server global lock
@@ -104,7 +108,47 @@ def get_source_title(p: Path) -> str:
         pass
     return None
 
-def clean_tags(p: Path, title: str, artist: str, album: str):
+def get_source_track_number(p: Path) -> str:
+    """Read track number from any supported audio file using mutagen's easy interface."""
+    try:
+        audio = mutagen.File(str(p), easy=True)
+        if audio and 'tracknumber' in audio:
+            tn = audio['tracknumber']
+            if isinstance(tn, list) and tn:
+                return tn[0].strip()
+            return str(tn).strip()
+    except:
+        pass
+    return None
+
+def extract_album_art(p: Path) -> bytes | None:
+    """Extract embedded album art from a FLAC or MP3 file."""
+    ext = p.suffix.lower()
+    try:
+        if ext == '.flac':
+            audio = FLAC(str(p))
+            if audio.pictures:
+                return audio.pictures[0].data
+        elif ext == '.mp3':
+            tags = ID3(str(p))
+            apic_frames = tags.getall('APIC')
+            if apic_frames:
+                return apic_frames[0].data
+    except Exception:
+        pass
+    return None
+
+def resize_album_art(image_data: bytes, size: tuple = ALBUM_ART_SIZE) -> bytes:
+    """Resize album art to target dimensions and return as JPEG bytes."""
+    img = Image.open(io.BytesIO(image_data))
+    img = img.convert('RGB')  # Ensure RGB (strips alpha, handles palette PNGs)
+    if img.size[0] > size[0] or img.size[1] > size[1]:
+        img = img.resize(size, Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=90)
+    return buf.getvalue()
+
+def clean_tags(p: Path, title: str, artist: str, album: str, track_number: str = None, artwork_data: bytes = None):
     try:
         # Read existing title from metadata before wiping
         existing_title = get_existing_title(p)
@@ -118,16 +162,25 @@ def clean_tags(p: Path, title: str, artist: str, album: str):
         tags.add(TIT2(encoding=3, text=final_title))
         tags.add(TPE1(encoding=3, text=artist))
         tags.add(TALB(encoding=3, text=album))
-        tags.add(TRCK(encoding=3, text="1"))
+        tags.add(TRCK(encoding=3, text=track_number if track_number else "1"))
         tags.add(TDRC(encoding=3, text="2000"))
+        # Embed album art if available
+        if artwork_data:
+            tags.add(APIC(
+                encoding=3,
+                mime='image/jpeg',
+                type=3,        # 3 = Cover (front)
+                desc='Cover',
+                data=artwork_data,
+            ))
         tags.save(p, v2_version=3)
     except: pass
 
-def convert_flac_to_mp3(src: Path, dest_dir: Path) -> Path:
-    """Convert a FLAC file to MP3 320kbps using FFmpeg. Returns the output path."""
+def convert_flac_to_mp3(src: Path, dest_dir: Path, bitrate: int = 320) -> Path:
+    """Convert a FLAC file to MP3 using FFmpeg at the specified bitrate. Returns the output path."""
     dest = dest_dir / f"{src.stem}.mp3"
     result = subprocess.run(
-        ['ffmpeg', '-y', '-i', str(src), '-codec:a', 'libmp3lame', '-b:a', '320k',
+        ['ffmpeg', '-y', '-i', str(src), '-codec:a', 'libmp3lame', '-b:a', f'{bitrate}k',
          '-write_id3v2', '1', '-id3v2_version', '3', str(dest)],
         capture_output=True, text=True
     )
@@ -135,7 +188,7 @@ def convert_flac_to_mp3(src: Path, dest_dir: Path) -> Path:
         raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "FFmpeg error")
     return dest
 
-def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: threading.Event, ffmpeg_ok: threading.Event):
+def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: threading.Event, ffmpeg_ok: threading.Event, bitrate: int = 320):
     """Worker function: prepare a single audio file for iPod transfer.
     Converts FLAC→MP3 or copies MP3 to temp dir, then applies ID3 tags.
     Runs in a thread pool — must NOT touch COM objects.
@@ -157,6 +210,13 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
     else:
         artist_name = strip_year(folder.name)
         album_name = strip_year(folder.name)
+
+    # Read the track number from source before any conversion
+    track_number = get_source_track_number(audio)
+
+    # Extract and resize album art from source before conversion
+    raw_art = extract_album_art(audio)
+    artwork_data = resize_album_art(raw_art) if raw_art else None
 
     result = {
         "audio": audio,
@@ -182,7 +242,7 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
             result["ffmpeg_missing"] = True
             return result
         try:
-            mp3_path = convert_flac_to_mp3(audio, temp_subdir)
+            mp3_path = convert_flac_to_mp3(audio, temp_subdir, bitrate)
             final_path = temp_subdir / f"{new_stem}.mp3"
             if mp3_path != final_path:
                 mp3_path.rename(final_path)
@@ -199,8 +259,8 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
         final_path = temp_subdir / f"{new_stem}.mp3"
         shutil.copy2(str(audio), str(final_path))
 
-    # Tag the file (mutagen, no COM)
-    clean_tags(final_path, new_stem, artist_name, album_name)
+    # Tag the file (mutagen, no COM) — preserve original track number and album art
+    clean_tags(final_path, new_stem, artist_name, album_name, track_number, artwork_data)
     result["final_path"] = final_path
     return result
 
@@ -243,6 +303,7 @@ def sync():
     cancel_event.clear()
     data = request.json
     folder = Path(data.get("folder", ""))
+    bitrate = data.get("bitrate", 320)
     
     def generate():
         global is_busy
@@ -303,13 +364,13 @@ def sync():
             if files_to_process:
                 ffmpeg_ok = threading.Event()
                 ffmpeg_ok.set()  # Assume FFmpeg is available until proven otherwise
-                yield log(f"⚡ Starting conversion pipeline ({CONVERSION_WORKERS} workers, {len(files_to_process)} files)...")
+                yield log(f"⚡ Starting conversion pipeline ({CONVERSION_WORKERS} workers, {len(files_to_process)} files, {bitrate}kbps)...")
 
                 with ThreadPoolExecutor(max_workers=CONVERSION_WORKERS) as executor:
                     # Submit all files for parallel preparation
                     future_list = []  # [(future, idx, audio), ...] — maintains submission order
                     for idx, audio in files_to_process:
-                        future = executor.submit(prepare_file, audio, temp_dir, folder, cancel_event, ffmpeg_ok)
+                        future = executor.submit(prepare_file, audio, temp_dir, folder, cancel_event, ffmpeg_ok, bitrate)
                         future_list.append((future, idx, audio))
 
                     # Consume results in order — blocks on each future until ready
@@ -430,6 +491,7 @@ def ipod_library():
                 track = {
                     "name": t.Name or "Untitled",
                     "trackId": t.TrackDatabaseID,
+                    "trackNumber": t.TrackNumber or 0,
                     "duration": t.Duration,
                     "size": t.Size,
                 }
@@ -442,7 +504,7 @@ def ipod_library():
     for artist_name in sorted(tree.keys(), key=str.lower):
         albums = []
         for album_name in sorted(tree[artist_name].keys(), key=str.lower):
-            tracks = sorted(tree[artist_name][album_name], key=lambda t: t["name"].lower())
+            tracks = sorted(tree[artist_name][album_name], key=lambda t: (t["trackNumber"], t["name"].lower()))
             albums.append({"name": album_name, "tracks": tracks})
         library.append({"name": artist_name, "albums": albums})
 
