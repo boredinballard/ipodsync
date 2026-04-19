@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 from flask import Flask, request, jsonify, Response, stream_with_context
+from network_utils import normalize_path, is_network_path, validate_path as validate_path_util, safe_resolve
 
 try:
     import win32com.client
@@ -12,13 +13,19 @@ try:
     from mutagen.mp3 import MP3
     from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, TDRC, APIC, ID3NoHeaderError
     from mutagen.flac import FLAC
+    from mutagen.mp4 import MP4, MP4Cover
     from PIL import Image
     import io
 except ImportError:
     print("❌ Missing dependencies: pip install flask pywin32 mutagen Pillow")
     sys.exit(1)
 
-SUPPORTED_EXTENSIONS = {'.mp3', '.flac'}
+# iPod-native formats — transferred as-is (no conversion)
+IPOD_NATIVE_EXTENSIONS = {'.mp3', '.aac', '.m4a'}
+# Formats that require FFmpeg conversion to MP3
+CONVERT_EXTENSIONS = {'.flac', '.wav', '.aiff', '.aif', '.alac'}
+# All recognised audio extensions
+SUPPORTED_EXTENSIONS = IPOD_NATIVE_EXTENSIONS | CONVERT_EXTENSIONS
 CONVERSION_WORKERS = min(os.cpu_count() or 6, 6)  # Default parallel FFmpeg processes
 ALBUM_ART_SIZE = (500, 500)  # Target album art dimensions in px (fallback default)
 
@@ -81,6 +88,40 @@ def slugify(name: str) -> str:
     slug = re.sub(r'[^a-z0-9]+', '_', slug)
     slug = slug.strip('_')
     return slug if slug else ''.join(random.choices(string.ascii_uppercase, k=7))
+
+def scan_audio_files(root: Path) -> list:
+    """Walk directory tree for audio files. Uses os.walk for speed on network shares.
+    pathlib.rglob() creates a Path object and stat()s every entry, which is
+    extremely slow over SMB. os.walk batches directory reads.
+    """
+    results = []
+    for dirpath, _, filenames in os.walk(str(root)):
+        for fname in filenames:
+            if os.path.splitext(fname)[1].lower() in SUPPORTED_EXTENSIONS:
+                results.append(Path(dirpath) / fname)
+    return results
+
+def buffered_copy(src: Path, dst: Path, buffer_size: int = 1024 * 1024):
+    """Copy file with a large buffer — significantly faster over network/SMB
+    than shutil.copy2's default small buffer.
+    """
+    with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
+        shutil.copyfileobj(fsrc, fdst, length=buffer_size)
+    try:
+        shutil.copystat(str(src), str(dst))
+    except OSError:
+        pass  # Metadata copy may fail on some network shares — non-critical
+
+def read_with_retry(func, path, retries=1, delay=0.5):
+    """Call func(path) with retry logic for transient network I/O errors."""
+    for attempt in range(retries + 1):
+        try:
+            return func(path)
+        except (IOError, OSError) as e:
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                return None
 
 def strip_year(name: str) -> str:
     """Remove year patterns from folder/album names.
@@ -145,13 +186,18 @@ def get_source_year(p: Path) -> str:
     return None
 
 def extract_album_art(p: Path) -> bytes | None:
-    """Extract album art from the folder (cover.jpg/folder.jpg) or embedded in a FLAC/MP3 file."""
-    # 1. Check parent folder for images first
+    """Extract album art from the folder (cover.jpg/folder.jpg) or embedded in a FLAC/MP3/M4A file."""
+    # 1. Check parent folder for images first (case-insensitive)
+    # Build a lookup of lowercased filename -> actual path for the directory
+    try:
+        folder_files = {f.name.lower(): f for f in p.parent.iterdir() if f.is_file()}
+    except OSError:
+        folder_files = {}
     for img_name in ['cover.jpg', 'folder.jpg', 'cover.png', 'folder.png', 'front.jpg']:
-        img_path = p.parent / img_name
-        if img_path.is_file():
+        match = folder_files.get(img_name)
+        if match:
             try:
-                return img_path.read_bytes()
+                return match.read_bytes()
             except Exception:
                 pass
 
@@ -167,6 +213,11 @@ def extract_album_art(p: Path) -> bytes | None:
             apic_frames = tags.getall('APIC')
             if apic_frames:
                 return apic_frames[0].data
+        elif ext in ('.m4a', '.aac'):
+            mp4 = MP4(str(p))
+            covers = mp4.tags.get('covr', [])
+            if covers:
+                return bytes(covers[0])
     except Exception:
         pass
     return None
@@ -209,21 +260,46 @@ def clean_tags(p: Path, title: str, artist: str, album: str, track_number: str =
         tags.save(p, v2_version=3)
     except: pass
 
-def convert_flac_to_mp3(src: Path, dest_dir: Path, bitrate: int = 320) -> Path:
-    """Convert a FLAC file to MP3 using FFmpeg at the specified bitrate. Returns the output path."""
+def clean_tags_m4a(p: Path, title: str, artist: str, album: str, track_number: str = None, artwork_data: bytes = None, year: str = None):
+    """Rewrite MP4 atom tags on an AAC/M4A file for consistency with the rest of the library."""
+    try:
+        mp4 = MP4(str(p))
+        # Read existing title — preserve if present
+        existing_title = None
+        if '\xa9nam' in mp4.tags:
+            vals = mp4.tags['\xa9nam']
+            if vals and str(vals[0]).strip():
+                existing_title = str(vals[0]).strip()
+        final_title = existing_title if existing_title else title
+
+        mp4.tags['\xa9nam'] = [final_title]
+        mp4.tags['\xa9ART'] = [artist]
+        mp4.tags['\xa9alb'] = [album]
+        mp4.tags['trkn'] = [(int(track_number.split('/')[0]) if track_number else 1, 0)]
+        mp4.tags['\xa9day'] = [year if year else '2000']
+        if artwork_data:
+            mp4.tags['covr'] = [MP4Cover(artwork_data, imageformat=MP4Cover.FORMAT_JPEG)]
+        mp4.save()
+    except: pass
+
+def convert_to_mp3(src: Path, dest_dir: Path, bitrate: int = 320) -> Path:
+    """Convert any audio file to MP3 using FFmpeg at the specified bitrate. Returns the output path."""
     dest = dest_dir / f"{src.stem}.mp3"
     result = subprocess.run(
         ['ffmpeg', '-y', '-i', str(src), '-codec:a', 'libmp3lame', '-b:a', f'{bitrate}k',
          '-write_id3v2', '1', '-id3v2_version', '3', str(dest)],
-        capture_output=True, text=True
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        cwd=tempfile.gettempdir()  # Avoid UNC path as CWD — cmd.exe rejects it
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "FFmpeg error")
     return dest
 
-def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: threading.Event, ffmpeg_ok: threading.Event, bitrate: int = 320, art_size: tuple = ALBUM_ART_SIZE):
+def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: threading.Event, ffmpeg_ok: threading.Event, bitrate: int = 320, art_size: tuple = ALBUM_ART_SIZE, existing_composite: set = None):
     """Worker function: prepare a single audio file for iPod transfer.
     Converts FLAC→MP3 or copies MP3 to temp dir, then applies ID3 tags.
+    Also performs duplicate detection against the iPod library using the
+    source file's metadata title — this avoids a separate network pass.
     Runs in a thread pool — must NOT touch COM objects.
     Returns a result dict with file info or error details.
     art_size: target album art dimensions, or None to skip art embedding.
@@ -245,15 +321,13 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
         artist_name = strip_year(folder.name)
         album_name = strip_year(folder.name)
 
-    # Read the track number and year from source before any conversion
-    track_number = get_source_track_number(audio)
-    year = get_source_year(audio)
+    # Read the source title early — used for both duplicate detection and tagging
+    source_title = read_with_retry(get_source_title, audio)
 
-    # Extract and resize album art from source before conversion (skip if art_size is None)
-    artwork_data = None
-    if art_size is not None:
-        raw_art = extract_album_art(audio)
-        artwork_data = resize_album_art(raw_art, size=art_size) if raw_art else None
+    # Read the track number and year from source before any conversion
+    # Uses retry logic for transient network I/O errors
+    track_number = read_with_retry(get_source_track_number, audio)
+    year = read_with_retry(get_source_year, audio)
 
     result = {
         "audio": audio,
@@ -263,7 +337,28 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
         "final_path": None,
         "error": None,
         "ffmpeg_missing": False,
+        "skipped": False,
     }
+
+    # --- Duplicate detection (runs inside worker — no extra network I/O) ---
+    # Uses composite (artist, album, title) matching only — all three must
+    # match to be considered a duplicate.  Broader fallbacks (title-only,
+    # slug-only) were removed because common track names like "Introduction"
+    # or "Interlude" caused false positives across different artists.
+    if existing_composite is not None:
+        src_artist = artist_name.lower().strip()
+        src_album = album_name.lower().strip()
+        src_title = (source_title or "").lower().strip()
+
+        if src_title and (src_artist, src_album, src_title) in existing_composite:
+            result["skipped"] = True
+            return result
+
+    # Extract and resize album art from source before conversion (skip if art_size is None)
+    artwork_data = None
+    if art_size is not None:
+        raw_art = read_with_retry(extract_album_art, audio)
+        artwork_data = resize_album_art(raw_art, size=art_size) if raw_art else None
 
     # Bail early if cancelled
     if cancel_event.is_set():
@@ -273,31 +368,39 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
     temp_subdir = temp_dir / slugify(artist_name) / slugify(album_name)
     temp_subdir.mkdir(parents=True, exist_ok=True)
 
-    if ext == '.flac':
+    if ext in CONVERT_EXTENSIONS:
+        # Formats that need FFmpeg conversion to MP3 (FLAC, WAV, AIFF, ALAC)
         if not ffmpeg_ok.is_set():
             result["error"] = "ffmpeg_missing"
             result["ffmpeg_missing"] = True
             return result
         try:
-            mp3_path = convert_flac_to_mp3(audio, temp_subdir, bitrate)
+            mp3_path = convert_to_mp3(audio, temp_subdir, bitrate)
             final_path = temp_subdir / f"{new_stem}.mp3"
             if mp3_path != final_path:
                 mp3_path.rename(final_path)
         except FileNotFoundError:
-            ffmpeg_ok.clear()  # Signal all other workers to skip FLACs
+            ffmpeg_ok.clear()  # Signal all other workers to skip conversions
             result["error"] = "ffmpeg_not_found"
             result["ffmpeg_missing"] = True
             return result
         except (RuntimeError, Exception) as e:
             result["error"] = str(e)
             return result
+        # Tag the converted MP3 — preserve original track number and album art
+        clean_tags(final_path, new_stem, artist_name, album_name, track_number, artwork_data, year)
+    elif ext in ('.aac', '.m4a'):
+        # AAC/M4A — iPod-native, copy and retag with MP4 atoms
+        final_path = temp_subdir / f"{new_stem}{ext}"
+        buffered_copy(audio, final_path)
+        clean_tags_m4a(final_path, new_stem, artist_name, album_name, track_number, artwork_data, year)
     else:
         # MP3 — copy to temp dir (never modify source folder)
+        # Uses buffered copy for better throughput over network shares
         final_path = temp_subdir / f"{new_stem}.mp3"
-        shutil.copy2(str(audio), str(final_path))
-
-    # Tag the file (mutagen, no COM) — preserve original track number and album art
-    clean_tags(final_path, new_stem, artist_name, album_name, track_number, artwork_data, year)
+        buffered_copy(audio, final_path)
+        # Tag the file (mutagen, no COM) — preserve original track number and album art
+        clean_tags(final_path, new_stem, artist_name, album_name, track_number, artwork_data, year)
     result["final_path"] = final_path
     return result
 
@@ -321,6 +424,8 @@ def browse_folder():
     try:
         path = _tk_result.get(timeout=60)
         if isinstance(path, bool): path = None
+        if path:
+            path = str(normalize_path(path))
         return jsonify({"folder": path})
     except:
         return jsonify({"folder": None})
@@ -333,13 +438,38 @@ def cancel_sync():
         return jsonify({"cancelled": True})
     return jsonify({"cancelled": False, "error": "No sync in progress"})
 
+@app.route("/api/validate-path", methods=["POST"])
+def validate_path_route():
+    """Check reachability of a user-supplied path (local, mapped drive, or UNC)."""
+    raw = request.json.get("path", "")
+    p = normalize_path(raw)
+    result = validate_path_util(p)
+    result["normalized"] = str(p)
+    return jsonify(result)
+
+@app.route("/api/set-folder", methods=["POST"])
+def set_folder():
+    """Manually set the source folder (supports UNC and mapped drives)."""
+    if is_busy: return jsonify({"folder": None, "count": 0, "error": "Server is busy"})
+    raw = request.json.get("folder", "")
+    p = normalize_path(raw)
+    path_str = str(p)
+
+    # Quick reachability check
+    check = validate_path_util(p)
+    if not check["reachable"]:
+        return jsonify({"folder": path_str, "count": 0, "error": check["error"]})
+
+    files = scan_audio_files(p)
+    return jsonify({"folder": path_str, "count": len(files), "error": None})
+
 @app.route("/api/sync", methods=["POST"])
 def sync():
     global is_busy
     is_busy = True
     cancel_event.clear()
     data = request.json
-    folder = Path(data.get("folder", ""))
+    folder = normalize_path(data.get("folder", ""))
     bitrate = data.get("bitrate", 320)
     workers = max(1, min(16, int(data.get("workers", CONVERSION_WORKERS))))  # Clamp 1-16
     device_key = data.get("device", "5gen")
@@ -354,6 +484,9 @@ def sync():
         log = lambda m: f"data: {m}\n\n"
         art_label = f"{art_size[0]}×{art_size[1]}px" if art_size else "disabled"
         yield log(f"🎨 Device: {device_profile['name']} | Art: {art_label} | Bitrate: {bitrate}kbps")
+        net = is_network_path(folder)
+        if net:
+            yield log(f"🌐 Source: network share ({folder})")
         yield log(f"🚀 Scanning library: {folder.name}")
         temp_dir = None
         cancelled = False
@@ -366,18 +499,24 @@ def sync():
             # --- Pre-scan iPod library for duplicate detection ---
             yield log("🔍 Scanning iPod library for existing tracks...")
             lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
-            existing_in_lib = set()
+            # Composite (artist, album, title) set for precise matching —
+            # all three must match to skip a file as a duplicate.
+            existing_composite = set()  # {(artist_lower, album_lower, title_lower)}
             for t in lib.Tracks:
                 try:
-                    existing_in_lib.add(t.Name.lower().strip())
+                    title = (t.Name or "").lower().strip()
+                    artist = (t.Artist or "").lower().strip()
+                    album = (t.Album or "").lower().strip()
+                    if title:
+                        existing_composite.add((artist, album, title))
                 except:
                     continue
-            yield log(f"📋 iPod has {len(existing_in_lib)} existing tracks")
+            yield log(f"📋 iPod has {len(existing_composite)} existing tracks")
 
             # --- Scan source folder for audio files ---
-            audio_files = sorted([f for f in folder.rglob('*') if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS])
+            audio_files = sorted(scan_audio_files(folder))
             if not audio_files:
-                yield log("❌ No supported audio files found (.mp3, .flac)")
+                yield log("❌ No supported audio files found (.mp3, .flac, .aac, .m4a, .wav, .aiff, .alac)")
                 return
 
             total = len(audio_files)
@@ -389,92 +528,148 @@ def sync():
             errors = 0
             pending_ops = []  # IITOperationStatus objects from AddFile()
 
-            # --- Pre-sync duplicate check (before conversion) ---
-            files_to_process = []  # (original_idx, audio) tuples for non-duplicate files
-            for idx, audio in enumerate(audio_files, 1):
-                new_stem = slugify(audio.stem)
-                tag = f"[{idx}/{total}]"
-                keys_to_check = {new_stem.lower().strip()}
-                source_title = get_source_title(audio)
-                if source_title:
-                    keys_to_check.add(source_title.lower().strip())
-                if keys_to_check & existing_in_lib:
-                    yield log(f"  {tag} 🔗 Already on iPod: {audio.name}")
-                    skipped += 1
-                else:
-                    files_to_process.append((idx, audio))
+            # --- Helper: reconnect COM to iTunes/iPod ---
+            # The iTunes COM interface degrades after thousands of sequential
+            # AddFile() calls, eventually throwing E_INVALIDARG (0x80070057).
+            # This helper tears down and rebuilds the connection.
+            COM_RECONNECT_INTERVAL = 500  # Proactive reconnect every N transfers
 
-            if not files_to_process:
-                yield log("✅ All files already on iPod, nothing to sync.")
+            def reconnect_com():
+                """Reinitialize COM and re-acquire iTunes/iPod/library refs."""
+                nonlocal itunes, ipod, lib
+                try:
+                    pythoncom.CoUninitialize()
+                except:
+                    pass
+                pythoncom.CoInitialize()
+                itunes = win32com.client.Dispatch("iTunes.Application")
+                ipod = None
+                for source in itunes.Sources:
+                    if source.Kind == 2:
+                        ipod = source
+                        break
+                if ipod:
+                    lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
+                return ipod is not None
 
-            # --- Multi-threaded conversion + serial transfer pipeline ---
-            if files_to_process:
-                ffmpeg_ok = threading.Event()
-                ffmpeg_ok.set()  # Assume FFmpeg is available until proven otherwise
-                yield log(f"⚡ Starting conversion pipeline ({workers} workers, {len(files_to_process)} files, {bitrate}kbps)...")
+            # --- Combined duplicate-check + conversion pipeline ---
+            # Duplicate detection is performed inside each prepare_file worker
+            # using the metadata title that's already being read. This avoids
+            # a separate metadata-scan pass over the network.
+            ffmpeg_ok = threading.Event()
+            ffmpeg_ok.set()  # Assume FFmpeg is available until proven otherwise
+            yield log(f"⚡ Starting pipeline ({workers} workers, {total} files, {bitrate}kbps)...")
 
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    # Submit all files for parallel preparation
-                    future_list = []  # [(future, idx, audio), ...] — maintains submission order
-                    for idx, audio in files_to_process:
-                        future = executor.submit(prepare_file, audio, temp_dir, folder, cancel_event, ffmpeg_ok, bitrate, art_size)
-                        future_list.append((future, idx, audio))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                # Submit ALL files — workers will self-filter duplicates
+                future_list = []  # [(future, idx, audio), ...] — maintains submission order
+                for idx, audio in enumerate(audio_files, 1):
+                    future = executor.submit(
+                        prepare_file, audio, temp_dir, folder, cancel_event,
+                        ffmpeg_ok, bitrate, art_size, existing_composite
+                    )
+                    future_list.append((future, idx, audio))
 
-                    # Consume results in order — blocks on each future until ready
-                    ffmpeg_error_logged = False
-                    process_total = len(files_to_process)
-                    for process_idx, (future, idx, audio) in enumerate(future_list, 1):
-                        if cancel_event.is_set():
+                # Consume results in order — blocks on each future until ready
+                ffmpeg_error_logged = False
+                for process_idx, (future, idx, audio) in enumerate(future_list, 1):
+                    if cancel_event.is_set():
+                        cancelled = True
+                        yield log(f"⏹ Sync cancelled by user at file {idx}/{total}.")
+                        # Cancel remaining pending futures
+                        for f, _, _ in future_list:
+                            f.cancel()
+                        break
+
+                    tag = f"[{process_idx}/{total}]"
+                    try:
+                        result = future.result()  # Blocks until this file's prep is done
+                    except Exception as e:
+                        yield log(f"  {tag} ❌ Unexpected error preparing: {audio.name} — {e}")
+                        errors += 1
+                        continue
+
+                    # Handle duplicates detected by worker
+                    if result["skipped"]:
+                        yield log(f"  {tag} 🔗 Already on iPod: {audio.name}")
+                        skipped += 1
+                        continue
+
+                    # Handle worker errors
+                    if result["error"]:
+                        if result["error"] == "cancelled":
                             cancelled = True
-                            yield log(f"⏹ Sync cancelled by user at file {idx}/{total}.")
-                            # Cancel remaining pending futures
-                            for f, _, _ in future_list:
-                                f.cancel()
                             break
-
-                        tag = f"[{process_idx}/{process_total}]"
-                        try:
-                            result = future.result()  # Blocks until this file's prep is done
-                        except Exception as e:
-                            yield log(f"  {tag} ❌ Unexpected error preparing: {audio.name} — {e}")
+                        elif result["ffmpeg_missing"] and not ffmpeg_error_logged:
+                            yield log(f"  ❌ FFmpeg not found! Install FFmpeg and add it to PATH to convert audio files.")
+                            yield log(f"  ⏭️ Skipping all files that require conversion.")
+                            ffmpeg_error_logged = True
+                            errors += 1
+                            continue
+                        elif result["ffmpeg_missing"]:
+                            # Already logged the FFmpeg error, silently skip
+                            continue
+                        else:
+                            yield log(f"  {tag} ❌ Conversion failed: {audio.name} — {result['error']}")
                             errors += 1
                             continue
 
-                        # Handle worker errors
-                        if result["error"]:
-                            if result["error"] == "cancelled":
-                                cancelled = True
-                                break
-                            elif result["ffmpeg_missing"] and not ffmpeg_error_logged:
-                                yield log(f"  ❌ FFmpeg not found! Install FFmpeg and add it to PATH to convert FLAC files.")
-                                yield log(f"  ⏭️ Skipping all FLAC files.")
-                                ffmpeg_error_logged = True
-                                errors += 1
-                                continue
-                            elif result["ffmpeg_missing"]:
-                                # Already logged the FFmpeg error, silently skip
-                                continue
-                            else:
-                                yield log(f"  {tag} ❌ Conversion failed: {audio.name} — {result['error']}")
-                                errors += 1
-                                continue
+                    # --- Transfer to iPod on main thread (COM) ---
+                    final_path = result["final_path"]
+                    artist_name = result["artist"]
+                    album_name = result["album"]
 
-                        # --- Transfer to iPod on main thread (COM) ---
-                        final_path = result["final_path"]
-                        artist_name = result["artist"]
-                        album_name = result["album"]
+                    if cancel_event.is_set():
+                        cancelled = True
+                        yield log(f"⏹ Sync cancelled by user at file {idx}/{total}.")
+                        break
 
-                        if cancel_event.is_set():
-                            cancelled = True
-                            yield log(f"⏹ Sync cancelled by user at file {idx}/{total}.")
+                    # --- Proactive COM reconnect to prevent staleness ---
+                    if transfers > 0 and transfers % COM_RECONNECT_INTERVAL == 0:
+                        yield log(f"  🔄 Refreshing iTunes connection ({transfers} transfers)...")
+                        # Wait briefly for pending ops before reconnecting
+                        time.sleep(1)
+                        if reconnect_com():
+                            yield log(f"  ✅ Connection refreshed.")
+                        else:
+                            yield log(f"  ❌ Lost iPod connection after refresh!")
                             break
 
-                        yield log(f"  {tag} ✅ Transfer: {final_path.name}  ← {artist_name} / {album_name}")
-                        op_status = lib.AddFile(str(final_path.resolve()))
-                        if op_status is not None:
-                            pending_ops.append((op_status, final_path.name))
-                        time.sleep(0.3)
-                        transfers += 1
+                    yield log(f"  {tag} ✅ Transfer: {final_path.name}  ← {artist_name} / {album_name}")
+
+                    # --- AddFile with retry + COM reconnect on failure ---
+                    add_ok = False
+                    resolved_path = str(final_path.resolve())
+                    for attempt in range(4):  # Up to 4 attempts (1 initial + 3 retries)
+                        try:
+                            op_status = lib.AddFile(resolved_path)
+                            if op_status is not None:
+                                pending_ops.append((op_status, final_path.name))
+                            add_ok = True
+                            break
+                        except Exception as add_err:
+                            if attempt < 3:
+                                wait = (attempt + 1) * 2  # 2s, 4s, 6s backoff
+                                yield log(f"  ⚠️ AddFile failed (attempt {attempt+1}/4), retrying in {wait}s...")
+                                time.sleep(wait)
+                                # On 2nd+ retry, fully reconnect COM
+                                if attempt >= 1:
+                                    yield log(f"  🔄 Reconnecting iTunes COM interface...")
+                                    if not reconnect_com():
+                                        yield log(f"  ❌ Could not reconnect to iPod!")
+                                        break
+                            else:
+                                yield log(f"  ❌ AddFile failed after 4 attempts: {final_path.name} — {add_err}")
+                                errors += 1
+
+                    if not add_ok:
+                        continue  # Skip to next file
+
+                    time.sleep(0.3)
+                    transfers += 1
+
+            if transfers == 0 and skipped > 0 and errors == 0:
+                yield log("✅ All files already on iPod, nothing to sync.")
 
             # --- Finalization: Wait for iPod transfer to complete ---
             # AddFile() returns an IITOperationStatus whose .InProgress
@@ -648,7 +843,7 @@ def check_ffmpeg():
     try:
         result = subprocess.run(
             ['ffmpeg', '-version'],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10
         )
         if result.returncode == 0:
             # First line of ffmpeg -version contains the version string
@@ -665,8 +860,8 @@ def check_ffmpeg():
 
 @app.route("/api/list-mp3", methods=["POST"])
 def list_mp3():
-    folder = Path(request.json.get("folder", ""))
-    files = [f for f in folder.rglob('*') if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS]
+    folder = normalize_path(request.json.get("folder", ""))
+    files = scan_audio_files(folder)
     return jsonify({"count": len(files)})
 
 @app.route("/")

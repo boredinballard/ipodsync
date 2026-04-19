@@ -18,6 +18,18 @@
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #333; }
     .dot.on { background: #a6e3a1; box-shadow: 0 0 5px #a6e3a1; }
     .path-box { background: #000; padding: 10px; font-family: 'Share Tech Mono'; font-size: 12px; color: var(--accent); border-radius: 5px; overflow: hidden; text-overflow: ellipsis; }
+    .path-input-row { display: flex; gap: 6px; margin-top: 8px; }
+    .path-input { flex: 1; background: #000; color: var(--accent); border: 1px solid var(--border); border-radius: 5px; padding: 8px 10px; font-family: 'Share Tech Mono'; font-size: 12px; outline: none; }
+    .path-input:focus { border-color: var(--accent); box-shadow: 0 0 6px rgba(0,229,255,0.15); }
+    .path-input::placeholder { color: #333; }
+    .btn-sm { background: var(--accent); color: #000; border: none; padding: 8px 14px; border-radius: 5px; font-weight: 700; cursor: pointer; font-family: 'Rajdhani'; font-size: 12px; white-space: nowrap; transition: opacity 0.2s; }
+    .btn-sm:disabled { opacity: 0.3; pointer-events: none; }
+    .btn-sm:hover:not(:disabled) { opacity: 0.85; }
+    .net-status { font-family: 'Share Tech Mono'; font-size: 11px; padding: 4px 0 0 0; letter-spacing: 0.5px; transition: color 0.3s ease; min-height: 16px; }
+    .net-status.ok { color: var(--success); }
+    .net-status.err { color: var(--danger); }
+    .net-status.checking { color: #555; }
+    .net-status.hidden { display: none; }
     .btn { background: var(--accent); color: #000; border: none; padding: 10px; border-radius: 5px; font-weight: 700; cursor: pointer; width: 100%; font-family: 'Rajdhani'; transition: opacity 0.2s, background 0.2s; font-size: 14px; }
     .btn:disabled { opacity: 0.3; pointer-events: none; cursor: not-allowed; }
     .btn:hover:not(:disabled) { opacity: 0.85; }
@@ -143,6 +155,11 @@
             </div>
             <div class="path-box" id="path-box" style="margin-top:8px;">--- NO FOLDER ---</div>
             <button class="btn" id="btn-browse" onclick="pickFolder()" style="margin-top:10px;">BROWSE FOLDER</button>
+            <div class="path-input-row">
+                <input type="text" class="path-input" id="manual-path" placeholder="\\NAS\share\Music  or  Z:\Music" spellcheck="false">
+                <button class="btn-sm" id="btn-apply-path" onclick="applyManualPath()">APPLY</button>
+            </div>
+            <div class="net-status hidden" id="net-status"></div>
         </div>
 
         <div class="card">
@@ -345,14 +362,14 @@
                 dot.className = 'dot on';
                 label.textContent = d.version;
                 label.style.color = 'var(--accent)';
-                document.getElementById('term').innerHTML += `<div>> FFmpeg detected ✓</div>`;
+                termAppend(document.getElementById('term'), '> FFmpeg detected ✓');
             } else {
                 dot.className = 'dot';
                 dot.style.background = 'var(--danger)';
                 dot.style.boxShadow = '0 0 5px var(--danger)';
                 label.textContent = 'FFmpeg: NOT FOUND';
                 label.style.color = 'var(--danger)';
-                document.getElementById('term').innerHTML += `<div style="color:var(--danger)"> ⚠ FFmpeg not found — FLAC conversion disabled. ${d.error || ''}</div>`;
+                termAppend(document.getElementById('term'), ` ⚠ FFmpeg not found — FLAC conversion disabled. ${d.error || ''}`, 'color:var(--danger)');
             }
         } catch(e) {
             document.getElementById('ffmpeg-label').textContent = 'FFmpeg: check failed';
@@ -369,6 +386,7 @@
                 selectedPath = d.folder;
                 document.getElementById('path-box').textContent = d.folder;
                 document.getElementById('path-box').style.color = 'var(--accent)';
+                document.getElementById('manual-path').value = d.folder;
                 const r2 = await fetch('/api/list-mp3', {
                     method: 'POST', 
                     headers: {'Content-Type': 'application/json'}, 
@@ -377,14 +395,88 @@
                 const d2 = await r2.json();
                 if (d2.count > 0) {
                     document.getElementById('sync-btn').disabled = false;
-                    document.getElementById('term').innerHTML += `<div>> Folder linked: ${d2.count} files detected.</div>`;
+                    termAppend(document.getElementById('term'), `> Folder linked: ${d2.count} files detected.`);
                 } else {
                     document.getElementById('sync-btn').disabled = true;
-                    document.getElementById('term').innerHTML += `<div style="color:var(--danger)">> No audio files found (.mp3, .flac).</div>`;
+                    termAppend(document.getElementById('term'), ' No audio files found (.mp3, .flac, .aac, .m4a, .wav, .aiff, .alac).', 'color:var(--danger)');
                 }
+                validatePathStatus(d.folder);
             }
         } catch (e) {}
     }
+
+    // ─── Manual Path Entry ─────────────────────────────────────
+    async function applyManualPath() {
+        if (isBusy) return;
+        const raw = document.getElementById('manual-path').value.trim();
+        if (!raw) return;
+
+        const netStatus = document.getElementById('net-status');
+        netStatus.className = 'net-status checking';
+        netStatus.textContent = '⏳ Validating path...';
+
+        try {
+            const r = await fetch('/api/set-folder', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ folder: raw })
+            });
+            const d = await r.json();
+
+            if (d.error) {
+                netStatus.className = 'net-status err';
+                netStatus.textContent = `❌ ${d.error}`;
+                document.getElementById('sync-btn').disabled = true;
+                return;
+            }
+
+            selectedPath = d.folder;
+            document.getElementById('path-box').textContent = d.folder;
+            document.getElementById('path-box').style.color = 'var(--accent)';
+            document.getElementById('manual-path').value = d.folder;
+
+            if (d.count > 0) {
+                document.getElementById('sync-btn').disabled = false;
+                netStatus.className = 'net-status ok';
+                netStatus.textContent = `✅ Reachable · ${d.count} audio files`;
+                termAppend(document.getElementById('term'), `> Folder linked: ${d.count} files detected.`);
+            } else {
+                document.getElementById('sync-btn').disabled = true;
+                netStatus.className = 'net-status err';
+                netStatus.textContent = '⚠ No audio files found (.mp3, .flac, .aac, .m4a, .wav, .aiff, .alac)';
+            }
+        } catch (e) {
+            netStatus.className = 'net-status err';
+            netStatus.textContent = `❌ Connection error: ${e.message}`;
+        }
+    }
+
+    async function validatePathStatus(path) {
+        const netStatus = document.getElementById('net-status');
+        try {
+            const r = await fetch('/api/validate-path', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ path: path })
+            });
+            const d = await r.json();
+            if (d.reachable) {
+                const label = d.is_network ? `🌐 Network · ${d.latency_ms}ms` : `📂 Local`;
+                netStatus.className = 'net-status ok';
+                netStatus.textContent = `✅ ${label}`;
+            } else {
+                netStatus.className = 'net-status err';
+                netStatus.textContent = `❌ ${d.error || 'Unreachable'}`;
+            }
+        } catch (e) {
+            netStatus.className = 'net-status hidden';
+        }
+    }
+
+    // Handle Enter key in manual path input
+    document.getElementById('manual-path').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') applyManualPath();
+    });
 
     // ─── Sync ──────────────────────────────────────────────────
     async function startSync() {
@@ -421,30 +513,66 @@
             btn.textContent = '⏳ CANCELLING...';
             await fetch('/api/cancel-sync', { method: 'POST' });
             const term = document.getElementById('term');
-            term.innerHTML += `<div style="color:var(--danger)">⏹ Cancel requested — finishing current file...</div>`;
+            termAppend(term, '⏹ Cancel requested — finishing current file...', 'color:var(--danger)');
             term.scrollTop = term.scrollHeight;
         } catch(e) {}
+    }
+
+    const TERM_MAX_LINES = 500; // Cap visible terminal lines to prevent DOM bloat
+
+    function termAppend(term, html, style) {
+        const div = document.createElement('div');
+        if (style) div.setAttribute('style', style);
+        div.textContent = html;
+        term.appendChild(div);
+        // Trim oldest lines when over the cap
+        while (term.childElementCount > TERM_MAX_LINES) {
+            term.removeChild(term.firstElementChild);
+        }
     }
 
     async function executeStream(url, body) {
         const term = document.getElementById('term');
         term.innerHTML = "";
+        let scrollQueued = false;
+        function queueScroll() {
+            if (!scrollQueued) {
+                scrollQueued = true;
+                requestAnimationFrame(() => {
+                    term.scrollTop = term.scrollHeight;
+                    scrollQueued = false;
+                });
+            }
+        }
         try {
             const res = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
+            let partial = '';
             while (true) {
                 const {done, value} = await reader.read();
                 if (done) break;
-                decoder.decode(value).split('\n').forEach(line => {
+                partial += decoder.decode(value, {stream: true});
+                const lines = partial.split('\n');
+                partial = lines.pop(); // Keep incomplete line for next chunk
+                const frag = document.createDocumentFragment();
+                lines.forEach(line => {
                     if (!line.startsWith('data: ')) return;
-                    const msg = line.slice(6);
-                    term.innerHTML += `<div>${msg}</div>`;
-                    term.scrollTop = term.scrollHeight;
+                    const div = document.createElement('div');
+                    div.textContent = line.slice(6);
+                    frag.appendChild(div);
                 });
+                if (frag.childNodes.length > 0) {
+                    term.appendChild(frag);
+                    // Trim oldest lines when over the cap
+                    while (term.childElementCount > TERM_MAX_LINES) {
+                        term.removeChild(term.firstElementChild);
+                    }
+                    queueScroll();
+                }
             }
         } catch(e) {
-            term.innerHTML += `<div style="color:var(--danger)">❌ Error: ${e.message}</div>`;
+            termAppend(term, `❌ Error: ${e.message}`, 'color:var(--danger)');
         }
     }
 
@@ -715,7 +843,7 @@
 
         lockUI();
         const term = document.getElementById('term');
-        term.innerHTML += `<div>> Deleting ${ids.length} tracks from iPod...</div>`;
+        termAppend(term, `> Deleting ${ids.length} tracks from iPod...`);
 
         try {
             const r = await fetch('/api/delete-tracks', {
@@ -726,16 +854,16 @@
             const d = await r.json();
 
             if (d.success) {
-                term.innerHTML += `<div style="color:var(--success)">✅ Deleted ${d.deleted} track${d.deleted !== 1 ? 's' : ''} from iPod.</div>`;
+                termAppend(term, `✅ Deleted ${d.deleted} track${d.deleted !== 1 ? 's' : ''} from iPod.`, 'color:var(--success)');
                 if (d.errors && d.errors.length > 0) {
-                    term.innerHTML += `<div style="color:var(--danger)">⚠ ${d.errors.length} error(s) during deletion.</div>`;
+                    termAppend(term, `⚠ ${d.errors.length} error(s) during deletion.`, 'color:var(--danger)');
                 }
             } else {
-                term.innerHTML += `<div style="color:var(--danger)">❌ Delete failed: ${d.error}</div>`;
+                termAppend(term, `❌ Delete failed: ${d.error}`, 'color:var(--danger)');
             }
             term.scrollTop = term.scrollHeight;
         } catch(e) {
-            term.innerHTML += `<div style="color:var(--danger)">❌ Error: ${e.message}</div>`;
+            termAppend(term, `❌ Error: ${e.message}`, 'color:var(--danger)');
         }
 
         unlockUI();

@@ -30,7 +30,7 @@
 
 ## 🔊 Audio & Format Support
 
-- [ ] **AAC/M4A Support** — Extend supported formats beyond MP3 and FLAC.
+- [x] **Extended Format Support** — AAC, M4A, WAV, AIFF, and ALAC are now supported. AAC/M4A files are transferred as-is with MP4 atom retagging. WAV, AIFF, and ALAC are converted to MP3 via FFmpeg (like FLAC).
 - [x] **Configurable Bitrate** — Let the user choose MP3 bitrate for FLAC conversion (128, 192, 256, 320 kbps) instead of hardcoded 320.
 - [x] **Preserve Album Art During Conversion** — Ensure FFmpeg carries over embedded cover art from FLAC to MP3. Artwork is extracted from source files (FLAC/MP3), resized to 500×500px for iPod, and re-embedded as an APIC frame.
 
@@ -54,3 +54,13 @@
 - [ ] **Error Handling Hardening** — Better COM error recovery, retry logic for flaky iTunes COM connections.
 - [ ] **Packaging / Installer** — Bundle into a standalone `.exe` with PyInstaller so users don't need Python installed.
 - [ ] **macOS Support** — Investigate AppleScript or Music.app integration for macOS users (currently Windows-only via iTunes COM).
+
+---
+
+## 🌐 Network / Remote Sources
+
+- [x] **Mapped Drive & UNC Path Support** — Manual path entry for UNC paths (`\\NAS\share\Music`) and mapped drives (`Z:\Music`). Path normalization, reachability validation with latency indicator, `os.walk` for fast network scanning, buffered file copy, FFmpeg CWD fix for UNC paths, and retry logic for transient I/O errors.
+- [ ] **Estimated File Count Preview** — Show an estimated file count before starting a full scan, useful for large network libraries.
+- [ ] **Per-File Temp Cleanup** — Delete converted temp files immediately after each individual iPod transfer completes, rather than cleaning the entire temp directory after all transfers finish. Reduces peak disk usage for large syncs.
+- [ ] **Scan Result Caching** — For very large network libraries (50k+ files), cache the scan results to a local JSON file with a "Rescan" button, avoiding multi-minute re-scans on every sync.
+- [ ] **SMB Credential Prompting** — If a UNC share requires authentication, prompt for credentials or guide the user to use `net use`.
