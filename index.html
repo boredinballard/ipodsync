@@ -98,6 +98,8 @@
     .btn-danger { background: var(--danger-dim); color: var(--danger); border: 1px solid var(--danger); width: auto; padding: 8px 20px; font-size: 13px; letter-spacing: 1px; }
     .btn-danger:hover:not(:disabled) { background: var(--danger); color: #000; opacity: 1; }
     .delete-count { font-family: 'Share Tech Mono'; font-size: 12px; color: #555; }
+    .btn-warn { background: rgba(249,200,70,0.1); color: #f9c846; border: 1px solid #f9c846; width: 100%; padding: 10px; font-size: 14px; letter-spacing: 1px; margin-top: 8px; }
+    .btn-warn:hover:not(:disabled) { background: #f9c846; color: #000; opacity: 1; }
 
     /* Confirm modal */
     .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 100; opacity: 0; pointer-events: none; transition: opacity 0.2s ease; }
@@ -191,6 +193,7 @@
         <div class="card">
             <span class="card-label">03 / LIBRARY</span>
             <button id="refresh-btn" class="btn" onclick="refreshLibrary()">REFRESH LIBRARY</button>
+            <button id="fix-art-btn" class="btn btn-warn" onclick="fixArtwork()">🔧 FIX ARTWORK</button>
         </div>
     </div>
 
@@ -304,7 +307,7 @@
         isBusy = true;
         document.getElementById('status-tag').textContent = "BUSY - PROCESSING";
         document.getElementById('status-tag').style.color = "var(--danger)";
-        ['btn-browse', 'refresh-btn', 'delete-btn'].forEach(id => {
+        ['btn-browse', 'refresh-btn', 'delete-btn', 'fix-art-btn'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.disabled = true;
         });
@@ -316,6 +319,7 @@
         document.getElementById('status-tag').style.color = "var(--accent)";
         document.getElementById('btn-browse').disabled = false;
         document.getElementById('refresh-btn').disabled = false;
+        document.getElementById('fix-art-btn').disabled = false;
         if (selectedPath) document.getElementById('sync-btn').disabled = false;
         updateDeleteCount();
     }
@@ -869,6 +873,36 @@
         unlockUI();
         // Auto-refresh library after delete
         await refreshLibrary();
+    }
+
+    // ─── Fix Artwork ───────────────────────────────────────────
+    async function fixArtwork() {
+        if (isBusy) return;
+        switchTab('terminal');
+        lockUI();
+
+        // Transform button into cancel
+        const btn = document.getElementById('fix-art-btn');
+        btn.textContent = '⛔ CANCEL FIX';
+        btn.className = 'btn btn-danger';
+        btn.disabled = false;
+        btn.onclick = cancelSync;  // Reuse same cancel endpoint
+
+        const device = document.getElementById('device-select').value;
+        // Pass source folder if one is set (for missing-art lookups)
+        const payload = { device: device };
+        if (selectedPath) {
+            payload.source_folder = selectedPath;
+        }
+        await executeStream('/api/fix-artwork', payload);
+
+        // Revert button
+        btn.textContent = '🔧 FIX ARTWORK';
+        btn.className = 'btn btn-warn';
+        btn.onclick = fixArtwork;
+
+        unlockUI();
+        await checkIpod();
     }
 
     // ─── Init ──────────────────────────────────────────────────

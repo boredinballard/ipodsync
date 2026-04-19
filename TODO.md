@@ -18,6 +18,7 @@
 - [x] **Streaming Convert + Transfer Pipeline** — Instead of converting all FLACs first and then transferring all MP3s, process each file end-to-end (convert → tag → transfer) before moving on to the next. This overlaps conversion and transfer work and means the iPod starts receiving music immediately rather than waiting for the entire batch to finish converting.
 - [x] **Multi-Threaded FLAC Conversion** — Convert up to 4 FLAC files simultaneously using a thread pool (`ThreadPoolExecutor`) while transferring completed files to the iPod on the main thread. Conversion and transfer are fully overlapped — the next batch of files is already converting while the current file transfers.
 - [x] **Device-Specific Settings** — Album art dimensions, art embedding toggle, and recommended bitrate auto-adjust based on the selected iPod model (Nano, Mini, 5th/5.5th Gen, Classic, 4th Gen Mono/Color). Mono devices skip art embedding entirely for faster syncs and smaller files.
+- [x] **Fix Artwork Tool** — A "Fix Artwork" button that scans all tracks on the iPod and detects problematic album art (progressive JPEGs, oversized images, non-square dimensions, non-JPEG formats). Re-encodes them as iPod-compatible baseline JPEGs via the iTunes COM API. If a source folder is set, also attempts to add artwork for tracks that have none by matching artist/album folder structure.
 
 ### Backlog
 - [ ] **Selective Sync** — After browsing a folder, show a preview tree of what will be synced and let the user check/uncheck specific artists, albums, or tracks before syncing.
@@ -32,7 +33,7 @@
 
 - [x] **Extended Format Support** — AAC, M4A, WAV, AIFF, and ALAC are now supported. AAC/M4A files are transferred as-is with MP4 atom retagging. WAV, AIFF, and ALAC are converted to MP3 via FFmpeg (like FLAC).
 - [x] **Configurable Bitrate** — Let the user choose MP3 bitrate for FLAC conversion (128, 192, 256, 320 kbps) instead of hardcoded 320.
-- [x] **Preserve Album Art During Conversion** — Ensure FFmpeg carries over embedded cover art from FLAC to MP3. Artwork is extracted from source files (FLAC/MP3), resized to 500×500px for iPod, and re-embedded as an APIC frame.
+- [x] **Preserve Album Art During Conversion** — Ensure FFmpeg carries over embedded cover art from FLAC to MP3. Artwork is extracted from source files (FLAC/MP3), resized to exact square dimensions for iPod, and re-embedded as an APIC frame. Images are always re-encoded as **baseline (non-progressive) JPEG** for iPod firmware compatibility — progressive JPEGs display blank on native firmware. Non-square images are centred on a black canvas.
 
 ---
 

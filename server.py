@@ -185,8 +185,12 @@ def get_source_year(p: Path) -> str:
         pass
     return None
 
-def extract_album_art(p: Path) -> bytes | None:
-    """Extract album art from the folder (cover.jpg/folder.jpg) or embedded in a FLAC/MP3/M4A file."""
+def extract_album_art(p: Path) -> tuple[bytes | None, str]:
+    """Extract album art from the folder (cover.jpg/folder.jpg) or embedded in a FLAC/MP3/M4A file.
+
+    Returns (image_bytes, source_description) where source_description indicates
+    where the artwork came from (e.g. 'cover.jpg', 'embedded:FLAC', etc.).
+    """
     # 1. Check parent folder for images first (case-insensitive)
     # Build a lookup of lowercased filename -> actual path for the directory
     try:
@@ -197,7 +201,7 @@ def extract_album_art(p: Path) -> bytes | None:
         match = folder_files.get(img_name)
         if match:
             try:
-                return match.read_bytes()
+                return match.read_bytes(), f"file:{match.name}"
             except Exception:
                 pass
 
@@ -207,30 +211,126 @@ def extract_album_art(p: Path) -> bytes | None:
         if ext == '.flac':
             audio = FLAC(str(p))
             if audio.pictures:
-                return audio.pictures[0].data
+                return audio.pictures[0].data, "embedded:FLAC"
         elif ext == '.mp3':
             tags = ID3(str(p))
             apic_frames = tags.getall('APIC')
             if apic_frames:
-                return apic_frames[0].data
+                return apic_frames[0].data, "embedded:MP3"
         elif ext in ('.m4a', '.aac'):
             mp4 = MP4(str(p))
             covers = mp4.tags.get('covr', [])
             if covers:
-                return bytes(covers[0])
+                return bytes(covers[0]), "embedded:M4A"
     except Exception:
         pass
-    return None
+    return None, "none"
 
 def resize_album_art(image_data: bytes, size: tuple = ALBUM_ART_SIZE) -> bytes:
-    """Resize album art to target dimensions and return as JPEG bytes."""
+    """Resize album art to target dimensions and return as iPod-compatible JPEG bytes.
+
+    Always produces a square, baseline (non-progressive) JPEG at the exact
+    target dimensions.  The iPod native firmware does NOT support:
+      - Progressive JPEGs (displays blank)
+      - Very large images (>600px can cause display issues)
+      - Non-square images (may crop or distort)
+    """
     img = Image.open(io.BytesIO(image_data))
     img = img.convert('RGB')  # Ensure RGB (strips alpha, handles palette PNGs)
-    if img.size[0] > size[0] or img.size[1] > size[1]:
-        img = img.resize(size, Image.LANCZOS)
+
+    # Use thumbnail() to shrink while preserving aspect ratio, then paste
+    # onto an exact square canvas.  This guarantees the output is always
+    # exactly size×size, even if the source is rectangular or tiny.
+    if img.size != size:
+        # thumbnail() only shrinks — if source is smaller, resize up
+        if img.size[0] < size[0] and img.size[1] < size[1]:
+            img = img.resize(size, Image.LANCZOS)
+        else:
+            img.thumbnail(size, Image.LANCZOS)
+
+        # If aspect ratio didn't match, centre on a black square canvas
+        if img.size != size:
+            canvas = Image.new('RGB', size, (0, 0, 0))
+            offset = ((size[0] - img.size[0]) // 2, (size[1] - img.size[1]) // 2)
+            canvas.paste(img, offset)
+            img = canvas
+
     buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=90)
+    # progressive=False → baseline JPEG (iPod firmware requirement)
+    # subsampling=1     → 4:2:2 chroma (good quality, wide compatibility)
+    # optimize=True     → smaller file size without quality loss
+    img.save(buf, format='JPEG', quality=90, progressive=False, subsampling=1, optimize=True)
     return buf.getvalue()
+
+def detect_artwork_issues(image_data: bytes, target_size: tuple) -> dict:
+    """Analyse raw image bytes and return a dict of iPod-compatibility issues.
+
+    Checks for progressive JPEG encoding, oversized dimensions, non-square
+    aspect ratio, and non-JPEG format — all of which can cause the iPod
+    native firmware to display blank artwork.
+    """
+    issues = {
+        "progressive": False,
+        "oversized": False,
+        "non_square": False,
+        "non_jpeg": False,
+        "needs_fix": False,
+        "details": [],
+        "original_size": (0, 0),
+    }
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        issues["original_size"] = img.size
+
+        # Check format — iPod only reliably displays JPEG
+        if img.format and img.format.upper() != 'JPEG':
+            issues["non_jpeg"] = True
+            issues["details"].append(f"format:{img.format}")
+
+        # Check for progressive JPEG by scanning for SOF2 marker (0xFFC2)
+        # Baseline uses SOF0 (0xFFC0).  We scan the raw bytes because
+        # Pillow's info dict only exposes 'progressive' for some codecs.
+        if img.format and img.format.upper() == 'JPEG':
+            # Pillow exposes this via the info dict or the progressive attribute
+            progressive = img.info.get('progressive', False) or img.info.get('progression', False)
+            if not progressive:
+                # Fallback: scan raw bytes for SOF2 marker
+                data_view = image_data[:4096]  # Markers are in the header
+                i = 0
+                while i < len(data_view) - 1:
+                    if data_view[i] == 0xFF:
+                        marker = data_view[i + 1]
+                        if marker == 0xC2:  # SOF2 = progressive
+                            progressive = True
+                            break
+                        elif marker == 0xC0:  # SOF0 = baseline
+                            break
+                    i += 1
+            if progressive:
+                issues["progressive"] = True
+                issues["details"].append("progressive")
+
+        # Check dimensions
+        w, h = img.size
+        if w != h:
+            issues["non_square"] = True
+            issues["details"].append(f"{w}×{h}")
+        if w > target_size[0] or h > target_size[1]:
+            issues["oversized"] = True
+            issues["details"].append(f"oversized:{w}×{h}")
+
+    except Exception:
+        # If we can't even parse the image, it definitely needs fixing
+        issues["non_jpeg"] = True
+        issues["details"].append("unreadable")
+
+    issues["needs_fix"] = any([
+        issues["progressive"],
+        issues["oversized"],
+        issues["non_square"],
+        issues["non_jpeg"],
+    ])
+    return issues
 
 def clean_tags(p: Path, title: str, artist: str, album: str, track_number: str = None, artwork_data: bytes = None, year: str = None):
     try:
@@ -356,9 +456,31 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
 
     # Extract and resize album art from source before conversion (skip if art_size is None)
     artwork_data = None
+    art_diag = None  # Diagnostic info for logging
     if art_size is not None:
-        raw_art = read_with_retry(extract_album_art, audio)
-        artwork_data = resize_album_art(raw_art, size=art_size) if raw_art else None
+        extract_result = read_with_retry(extract_album_art, audio)
+        if extract_result and isinstance(extract_result, tuple):
+            raw_art, art_source = extract_result
+        else:
+            raw_art, art_source = extract_result, "unknown"
+        if raw_art:
+            try:
+                issues = detect_artwork_issues(raw_art, art_size)
+                artwork_data = resize_album_art(raw_art, size=art_size)
+                w, h = issues["original_size"]
+                flags = []
+                if issues["progressive"]: flags.append("progressive")
+                if issues["non_jpeg"]: flags.append("non-JPEG")
+                if issues["oversized"]: flags.append("oversized")
+                if issues["non_square"]: flags.append("non-square")
+                flag_str = f" [{', '.join(flags)}]" if flags else ""
+                art_diag = f"src={art_source} {w}×{h}{flag_str} → {art_size[0]}×{art_size[1]} ({len(artwork_data)//1024}KB)"
+            except Exception as e:
+                art_diag = f"src={art_source} ERROR: {e}"
+                artwork_data = None
+        else:
+            art_diag = "no artwork found"
+    result["art_diag"] = art_diag
 
     # Bail early if cancelled
     if cancel_event.is_set():
@@ -635,7 +757,10 @@ def sync():
                             yield log(f"  ❌ Lost iPod connection after refresh!")
                             break
 
+                    art_msg = f"  🎨 {result.get('art_diag', '?')}" if result.get('art_diag') else ""
                     yield log(f"  {tag} ✅ Transfer: {final_path.name}  ← {artist_name} / {album_name}")
+                    if art_msg:
+                        yield log(art_msg)
 
                     # --- AddFile with retry + COM reconnect on failure ---
                     add_ok = False
@@ -757,6 +882,382 @@ def sync():
             is_busy = False
             pythoncom.CoUninitialize()
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+@app.route("/api/fix-artwork", methods=["POST"])
+def fix_artwork():
+    """Scan all iPod tracks and re-encode problematic album art.
+
+    Detects progressive JPEGs, oversized images, non-square dimensions,
+    and non-JPEG formats, then re-encodes them through the iPod-compatible
+    baseline JPEG pipeline.  Streams progress as SSE events.
+
+    If a source_folder is provided, also attempts to find and add artwork
+    for tracks that currently have none.
+    """
+    global is_busy
+    is_busy = True
+    cancel_event.clear()
+    data = request.json or {}
+    device_key = data.get("device", "5gen")
+    source_folder = data.get("source_folder", None)
+    device_profile = DEVICE_PROFILES.get(device_key, DEVICE_PROFILES['5gen'])
+    art_size = device_profile['art_size']
+
+    def generate():
+        global is_busy
+        log = lambda m: f"data: {m}\n\n"
+        temp_dir = None
+        cancelled = False
+        try:
+            if art_size is None:
+                yield log("❌ Selected device has no display — artwork not applicable.")
+                return
+
+            art_label = f"{art_size[0]}×{art_size[1]}px"
+            yield log(f"🎨 Fix Artwork — Device: {device_profile['name']} | Target: {art_label}")
+
+            # Source folder for missing-art lookups (optional)
+            src_folder = None
+            if source_folder:
+                src_folder = normalize_path(source_folder)
+                check = validate_path_util(src_folder)
+                if check["reachable"]:
+                    yield log(f"📂 Source folder set: {src_folder} — will attempt to add missing artwork")
+                else:
+                    yield log(f"⚠️ Source folder unreachable ({source_folder}), skipping missing-art lookups")
+                    src_folder = None
+            else:
+                yield log("ℹ️ No source folder set — tracks with no artwork will be skipped")
+
+            itunes, ipod = get_ipod()
+            if not ipod:
+                yield log("❌ iPod not found.")
+                return
+
+            lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
+            total = lib.Tracks.Count
+            yield log(f"🔍 Scanning {total} tracks on iPod...")
+
+            temp_dir = Path(tempfile.mkdtemp(prefix="ipodsync_fixart_"))
+
+            fixed = 0
+            already_ok = 0
+            no_art = 0
+            added = 0
+            errors = 0
+
+            # --- COM reconnect helper (same pattern as sync) ---
+            COM_RECONNECT_INTERVAL = 200
+
+            def reconnect_com():
+                nonlocal itunes, ipod, lib
+                try:
+                    pythoncom.CoUninitialize()
+                except:
+                    pass
+                pythoncom.CoInitialize()
+                itunes = win32com.client.Dispatch("iTunes.Application")
+                ipod = None
+                for source in itunes.Sources:
+                    if source.Kind == 2:
+                        ipod = source
+                        break
+                if ipod:
+                    lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
+                return ipod is not None
+
+            processed = 0
+            # Reuse a single pair of temp files to avoid filesystem overhead
+            export_path = temp_dir / "export.tmp"
+            fixed_path = temp_dir / "fixed.jpg"
+            add_path = temp_dir / "add.jpg"
+            PROGRESS_INTERVAL = 100  # Report batch progress every N tracks
+
+            for i in range(1, total + 1):
+                if cancel_event.is_set():
+                    cancelled = True
+                    yield log(f"⏹ Cancelled at track {i}/{total}.")
+                    break
+
+                tag = f"[{i}/{total}]"
+                try:
+                    t = lib.Tracks.Item(i)
+                    art_count = t.Artwork.Count
+
+                    if art_count == 0:
+                        # --- No existing artwork on iPod ---
+                        artist = t.Artist or "Unknown"
+                        album = t.Album or "Unknown"
+                        name = t.Name or "Untitled"
+                        if src_folder:
+                            # Try to find artwork from source folder
+                            source_art, search_log = _find_source_artwork(src_folder, artist, album, verbose=True)
+                            if source_art:
+                                try:
+                                    issues = detect_artwork_issues(source_art, art_size)
+                                    processed_art = resize_album_art(source_art, size=art_size)
+                                    add_path.write_bytes(processed_art)
+                                    w, h = issues["original_size"]
+                                    flags = ", ".join(issues["details"]) if issues["details"] else "OK"
+                                    try:
+                                        t.AddArtworkFromFile(str(add_path))
+                                        added += 1
+                                        yield log(f"  {tag} ➕ Added: {artist} / {album} ({w}×{h} {flags} → {art_size[0]}×{art_size[1]})")
+                                    except Exception as e:
+                                        yield log(f"  {tag} ⚠️ COM add failed: {artist} / {album} — {e}")
+                                        errors += 1
+                                except Exception as e:
+                                    yield log(f"  {tag} ⚠️ Art processing failed: {artist} / {album} — {e}")
+                                    errors += 1
+                            else:
+                                no_art += 1
+                                yield log(f"  {tag} 🔍 No art found: {artist} / {album} — {search_log}")
+                        else:
+                            no_art += 1
+                        processed += 1
+
+                    else:
+                        # --- Has artwork — check if it needs fixing ---
+                        artwork_obj = t.Artwork.Item(1)
+                        exported = False
+                        for attempt in range(3):
+                            try:
+                                artwork_obj.SaveArtworkToFile(str(export_path))
+                                exported = True
+                                break
+                            except Exception:
+                                if attempt < 2:
+                                    time.sleep(0.5 * (attempt + 1))
+                                    try:
+                                        artwork_obj = t.Artwork.Item(1)
+                                    except:
+                                        pass
+                        if not exported:
+                            artist = t.Artist or "Unknown"
+                            album = t.Album or "Unknown"
+                            yield log(f"  {tag} ⚠️ Could not export artwork: {artist} / {album} (skipped after 3 attempts)")
+                            errors += 1
+                            processed += 1
+                            continue
+
+                        raw_data = export_path.read_bytes()
+                        issues = detect_artwork_issues(raw_data, art_size)
+
+                        if not issues["needs_fix"]:
+                            already_ok += 1
+                            processed += 1
+                        else:
+                            # --- Fix the artwork ---
+                            artist = t.Artist or "Unknown"
+                            album = t.Album or "Unknown"
+                            name = t.Name or "Untitled"
+                            issue_desc = ", ".join(issues["details"])
+                            w, h = issues["original_size"]
+                            processed_art = resize_album_art(raw_data, size=art_size)
+                            fixed_path.write_bytes(processed_art)
+
+                            replaced = False
+                            for attempt in range(3):
+                                try:
+                                    artwork_obj.Delete()
+                                    t.AddArtworkFromFile(str(fixed_path))
+                                    replaced = True
+                                    break
+                                except Exception:
+                                    if attempt < 2:
+                                        time.sleep(0.5 * (attempt + 1))
+                            if replaced:
+                                fixed += 1
+                                yield log(f"  {tag} ✅ Fixed: {artist} / {album} / {name} ({w}×{h} {issue_desc} → {art_size[0]}×{art_size[1]})")
+                            else:
+                                yield log(f"  {tag} ❌ Failed to replace: {artist} / {album} / {name}")
+                                errors += 1
+
+                            processed += 1
+
+                    # --- Periodic progress report (for non-logged tracks) ---
+                    if processed > 0 and processed % PROGRESS_INTERVAL == 0:
+                        yield log(f"  ⏳ Progress: {processed}/{total} scanned — {fixed} fixed, {added} added, {already_ok} OK, {no_art} no art")
+
+                    # --- Proactive COM reconnect ---
+                    if processed > 0 and processed % COM_RECONNECT_INTERVAL == 0:
+                        yield log(f"  🔄 Refreshing iTunes connection ({processed} tracks)...")
+                        time.sleep(1)
+                        if reconnect_com():
+                            total = lib.Tracks.Count
+                            yield log(f"  ✅ Connection refreshed.")
+                        else:
+                            yield log(f"  ❌ Lost iPod connection after refresh!")
+                            break
+
+                except Exception as e:
+                    yield log(f"  {tag} ❌ Error: {e}")
+                    errors += 1
+                    processed += 1
+
+            # --- Summary ---
+            summary_parts = []
+            if fixed > 0:
+                summary_parts.append(f"{fixed} fixed")
+            if added > 0:
+                summary_parts.append(f"{added} added")
+            if already_ok > 0:
+                summary_parts.append(f"{already_ok} already OK")
+            if no_art > 0:
+                summary_parts.append(f"{no_art} no artwork")
+            if errors > 0:
+                summary_parts.append(f"{errors} error{'s' if errors != 1 else ''}")
+            summary = ", ".join(summary_parts) if summary_parts else "nothing to process"
+
+            if cancelled:
+                yield log(f"⚠️ CANCELLED — {summary}")
+            else:
+                yield log(f"☑️ DONE ☑️ {summary}")
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            yield log(f"❌ Error: {str(e)}")
+            for line in tb.strip().splitlines():
+                yield log(f"  📋 {line}")
+        finally:
+            if temp_dir and temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            cancel_event.clear()
+            is_busy = False
+            pythoncom.CoUninitialize()
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
+def _find_source_artwork(src_folder: Path, artist: str, album: str, verbose: bool = False):
+    """Try to find album art in the source folder by matching artist/album directory structure.
+
+    Uses case-insensitive and fuzzy directory matching because iPod track
+    metadata (artist/album) was derived from folder names with strip_year()
+    applied, so the original folder may have year prefixes, different casing,
+    or special characters.
+
+    When verbose=True, returns (bytes|None, search_log_str).
+    When verbose=False, returns bytes|None (backward compatible).
+    """
+    artist_lower = artist.lower().strip()
+    album_lower = album.lower().strip()
+    artist_slug = slugify(artist)
+    search_log = []
+
+    # --- Step 1: Find matching artist directory ---
+    matched_artist_dirs = []
+    try:
+        all_dirs = [e for e in src_folder.iterdir() if e.is_dir()]
+        search_log.append(f"scanned {len(all_dirs)} top dirs")
+        for entry in all_dirs:
+            name = entry.name
+            name_lower = name.lower()
+            stripped = strip_year(name).lower()
+
+            # Exact or slug match (best)
+            if name_lower == artist_lower or slugify(name) == artist_slug:
+                matched_artist_dirs.insert(0, entry)  # priority
+            # Substring match (fallback)
+            elif artist_lower in name_lower or artist_lower in stripped:
+                matched_artist_dirs.append(entry)
+    except OSError as e:
+        result = (None, f"OS error scanning source folder: {e}") if verbose else None
+        return result
+
+    if not matched_artist_dirs:
+        search_log.append(f"no artist dir matched '{artist}'")
+        result = (None, "; ".join(search_log)) if verbose else None
+        return result
+
+    search_log.append(f"artist matched: {[d.name for d in matched_artist_dirs]}")
+
+    # --- Step 2: For each artist dir, find matching album directory ---
+    album_slug = slugify(album)
+    for artist_dir in matched_artist_dirs:
+        matched_album_dirs = []
+        try:
+            for entry in artist_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                name = entry.name
+                name_lower = name.lower()
+                stripped = strip_year(name).lower()
+
+                # Exact or slug match (best)
+                if name_lower == album_lower or stripped == album_lower or slugify(name) == album_slug:
+                    matched_album_dirs.insert(0, entry)  # priority
+                # Substring match (fallback)
+                elif album_lower in name_lower or album_lower in stripped:
+                    matched_album_dirs.append(entry)
+        except OSError:
+            continue
+
+        if not matched_album_dirs:
+            continue
+
+        search_log.append(f"album matched: {[d.name for d in matched_album_dirs]}")
+
+        # --- Step 3: Check matched album dirs for artwork ---
+        for album_dir in matched_album_dirs:
+            art = _scan_folder_for_art(album_dir)
+            if art:
+                result = (art, "; ".join(search_log)) if verbose else art
+                return result
+            else:
+                search_log.append(f"no art files in '{album_dir.name}'")
+
+    if not any("album matched" in s for s in search_log):
+        search_log.append(f"no album dir matched '{album}'")
+
+    result = (None, "; ".join(search_log)) if verbose else None
+    return result
+
+
+def _scan_folder_for_art(folder: Path) -> bytes | None:
+    """Look for cover image files in the given folder.
+
+    Priority: external cover images first, then embedded artwork from audio files.
+    """
+    try:
+        entries = list(folder.iterdir())
+        files = {f.name.lower(): f for f in entries if f.is_file()}
+    except OSError:
+        return None
+
+    # 1. External cover images (most common names)
+    for img_name in ['cover.jpg', 'folder.jpg', 'cover.png', 'folder.png',
+                     'front.jpg', 'front.png', 'album.jpg', 'album.png',
+                     'albumart.jpg', 'albumartsmall.jpg', 'thumb.jpg']:
+        match = files.get(img_name)
+        if match:
+            try:
+                return match.read_bytes()
+            except Exception:
+                pass
+
+    # 2. Any .jpg/.png file in the folder (some libraries use arbitrary names)
+    for fname, fpath in files.items():
+        if fname.endswith(('.jpg', '.jpeg', '.png')) and fpath.stat().st_size > 10000:
+            try:
+                return fpath.read_bytes()
+            except Exception:
+                pass
+
+    # 3. Fallback: embedded artwork from the first audio file in the folder
+    for fname, fpath in files.items():
+        ext = os.path.splitext(fname)[1]
+        if ext in SUPPORTED_EXTENSIONS:
+            try:
+                art_data, _src = extract_album_art(fpath)
+                if art_data:
+                    return art_data
+            except Exception:
+                pass
+            break  # Only try one audio file to avoid being slow
+
+    return None
+
 
 @app.route("/api/ipod-library", methods=["POST"])
 def ipod_library():
