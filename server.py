@@ -948,7 +948,17 @@ def sync():
                             tracks_no_art = 0
                             source_art_cache = {}  # album_key -> raw_art or None
 
+                            # Clear cancel_event so we can detect NEW cancellations
+                            # during artwork. The 'cancelled' flag preserves whether
+                            # the transfer phase was cancelled.
+                            cancel_event.clear()
+
                             for t in itdb_tracks:
+                                if cancel_event.is_set():
+                                    cancelled = True
+                                    yield log("  ⏹ Artwork generation cancelled.")
+                                    break
+
                                 dbid = t['dbid']
                                 t_artist = (t.get('artist') or "").lower().strip()
                                 t_album = (t.get('album') or "").lower().strip()
