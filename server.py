@@ -909,8 +909,9 @@ def sync():
                         yield log(f"⏳ Stabilizing — {len(pending_ops)} ops pending ({elapsed}s)")
 
             # --- Direct artwork generation pass ---
-            # Build ArtworkDB + .ithmb files directly on iPod filesystem,
-            # completely bypassing iTunes COM for artwork.
+            # Build ArtworkDB + .ithmb files directly on iPod filesystem.
+            # All metadata (dbid, artist, album) is parsed from the binary
+            # iTunesDB — no COM calls needed, making this very fast.
             art_applied = 0
             if fix_art_after_sync and art_size is not None and transfers > 0 and album_art_map:
                 status = "partial" if cancelled else "full"
@@ -921,68 +922,52 @@ def sync():
                     yield log("  ❌ Could not locate iPod drive — skipping artwork generation.")
                 else:
                     try:
-                        # Parse iTunesDB to get persistent 8-byte dbids for all tracks
-                        yield log("  📋 Reading track database IDs from iTunesDB...")
+                        # Parse iTunesDB for dbids + artist/album (binary only, no COM)
+                        yield log("  📋 Reading track metadata from iTunesDB...")
                         itdb_tracks = parse_itunesdb_dbids(ipod_drive)
                         if not itdb_tracks:
                             yield log("  ❌ Could not parse iTunesDB — skipping artwork.")
                         else:
                             yield log(f"  📋 Found {len(itdb_tracks)} tracks in iTunesDB")
 
-                            # Re-read iPod library via COM to get artist/album metadata
-                            # and map each track's COM index to its iTunesDB dbid
-                            yield log("  🔄 Refreshing COM connection to map tracks...")
-                            time.sleep(2)
-                            if not reconnect_com():
-                                yield log("  ❌ Lost iPod connection — skipping artwork.")
-                            else:
-                                # Build {index: dbid} mapping via COM track order
-                                # COM tracks are in the same order as iTunesDB mhit entries
-                                total_ipod = lib.Tracks.Count
-                                if total_ipod != len(itdb_tracks):
-                                    yield log(f"  ⚠️ Track count mismatch: COM={total_ipod} vs iTunesDB={len(itdb_tracks)}")
+                            # Match tracks to artwork using binary-parsed artist/album
+                            artwork_db = ArtworkDBWriter()
+                            tracks_with_art = 0
+                            tracks_no_art = 0
 
-                                # Build the ArtworkDB
-                                artwork_db = ArtworkDBWriter()
-                                tracks_with_art = 0
-                                tracks_no_art = 0
+                            for t in itdb_tracks:
+                                dbid = t['dbid']
+                                t_artist = (t.get('artist') or "").lower().strip()
+                                t_album = (t.get('album') or "").lower().strip()
+                                album_key = (t_artist, t_album)
 
-                                for i in range(1, min(total_ipod, len(itdb_tracks)) + 1):
+                                raw_art = album_art_map.get(album_key)
+                                if not raw_art:
+                                    raw_art = _find_source_artwork(folder, t_artist, t_album, verbose=False)
+
+                                if raw_art and dbid:
                                     try:
-                                        t = lib.Tracks.Item(i)
-                                        t_artist = (t.Artist or "").lower().strip()
-                                        t_album = (t.Album or "").lower().strip()
-                                        album_key = (t_artist, t_album)
-                                        dbid = itdb_tracks[i - 1]['dbid']
-
-                                        raw_art = album_art_map.get(album_key)
-                                        if not raw_art:
-                                            # Try source folder for albums not in map
-                                            raw_art = _find_source_artwork(folder, t_artist, t_album, verbose=False)
-
-                                        if raw_art and dbid:
-                                            img = Image.open(io.BytesIO(raw_art)).convert('RGB')
-                                            artwork_db.add_artwork(dbid, img)
-                                            tracks_with_art += 1
-                                        else:
-                                            tracks_no_art += 1
+                                        img = Image.open(io.BytesIO(raw_art)).convert('RGB')
+                                        artwork_db.add_artwork(dbid, img)
+                                        tracks_with_art += 1
                                     except Exception:
                                         tracks_no_art += 1
-
-                                if tracks_with_art > 0:
-                                    # Write ArtworkDB + .ithmb files to iPod
-                                    artwork_dir = ipod_drive / "iPod_Control" / "Artwork"
-                                    yield log(f"  💾 Writing artwork: {tracks_with_art} tracks, {artwork_db._next_image_id - 101} unique images...")
-                                    stats = artwork_db.write(artwork_dir)
-                                    art_applied = tracks_with_art
-                                    yield log(f"  ✅ Artwork database written: {stats['db_size']//1024}KB ArtworkDB")
-                                    for fname, fsize in stats['ithmb_files'].items():
-                                        yield log(f"     {fname}: {fsize//1024}KB")
                                 else:
-                                    yield log("  ⚠️ No artwork found for any tracks.")
+                                    tracks_no_art += 1
 
-                                if tracks_no_art > 0:
-                                    yield log(f"  ℹ️ {tracks_no_art} tracks had no artwork available")
+                            if tracks_with_art > 0:
+                                artwork_dir = ipod_drive / "iPod_Control" / "Artwork"
+                                yield log(f"  💾 Writing artwork: {tracks_with_art} tracks, {artwork_db._next_image_id - 101} unique images...")
+                                stats = artwork_db.write(artwork_dir)
+                                art_applied = tracks_with_art
+                                yield log(f"  ✅ Artwork database written: {stats['db_size']//1024}KB ArtworkDB")
+                                for fname, fsize in stats['ithmb_files'].items():
+                                    yield log(f"     {fname}: {fsize//1024}KB")
+                            else:
+                                yield log("  ⚠️ No artwork found for any tracks.")
+
+                            if tracks_no_art > 0:
+                                yield log(f"  ℹ️ {tracks_no_art} tracks had no artwork available")
 
                     except Exception as art_err:
                         yield log(f"  ❌ Artwork generation error: {art_err}")
@@ -1075,36 +1060,22 @@ def fix_artwork():
                 return
             yield log(f"📋 Found {len(itdb_tracks)} tracks in iTunesDB")
 
-            # Step 3: Get track metadata via COM
-            pythoncom.CoInitialize()
-            itunes, ipod = get_ipod()
-            if not ipod:
-                yield log("❌ iPod not found via iTunes.")
-                return
-
-            lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
-            total = lib.Tracks.Count
-            yield log(f"🔍 Scanning {total} tracks on iPod...")
-
-            if total != len(itdb_tracks):
-                yield log(f"⚠️ Track count mismatch: COM={total} vs iTunesDB={len(itdb_tracks)}")
-
-            # Step 4: Match tracks to artwork and build ArtworkDB
+            # Step 3: Match tracks to artwork using binary-parsed metadata
+            # (no COM needed — artist/album parsed directly from iTunesDB)
             artwork_db = ArtworkDBWriter()
             tracks_with_art = 0
             tracks_no_art = 0
             errors = 0
 
-            for i in range(1, min(total, len(itdb_tracks)) + 1):
+            for idx, t in enumerate(itdb_tracks):
                 if cancel_event.is_set():
                     cancelled = True
                     break
 
                 try:
-                    t = lib.Tracks.Item(i)
-                    artist = t.Artist or "Unknown"
-                    album = t.Album or "Unknown"
-                    dbid = itdb_tracks[i - 1]['dbid']
+                    artist = t.get('artist') or "Unknown"
+                    album = t.get('album') or "Unknown"
+                    dbid = t['dbid']
 
                     raw_art = None
                     if src_folder:
@@ -1119,8 +1090,8 @@ def fix_artwork():
                 except Exception:
                     errors += 1
 
-                if i % 50 == 0:
-                    yield log(f"  ⏳ Processed {i}/{min(total, len(itdb_tracks))} tracks...")
+                if (idx + 1) % 200 == 0:
+                    yield log(f"  ⏳ Processed {idx + 1}/{len(itdb_tracks)} tracks...")
 
             if cancelled:
                 yield log("⏹ Cancelled during scan.")

@@ -30,14 +30,19 @@ from ithmb_writer import IthmBuilder, IPOD_5G_FORMATS
 
 
 def parse_itunesdb_dbids(ipod_drive: Path) -> list:
-    """Parse iTunesDB on the iPod and return track info list.
+    """Parse iTunesDB on the iPod and return track info with metadata.
+
+    Extracts persistent 8-byte dbids AND artist/album strings directly
+    from the binary iTunesDB, with no COM dependency.
 
     Args:
         ipod_drive: iPod mount point (e.g. Path('D:/'))
 
     Returns:
-        List of dicts: [{'track_id': int, 'dbid': int}, ...]
+        List of dicts: [{'track_id': int, 'dbid': int,
+                         'artist': str, 'album': str}, ...]
         The dbid is the 8-byte persistent ID at mhit+112.
+        Artist/album come from mhod type=4/type=3 string records.
     """
     itunesdb_path = ipod_drive / "iPod_Control" / "iTunes" / "iTunesDB"
     if not itunesdb_path.exists():
@@ -72,15 +77,41 @@ def parse_itunesdb_dbids(ipod_drive: Path) -> list:
                     break
                 t_hdr = struct.unpack_from('<I', data, it_pos + 4)[0]
                 t_total = struct.unpack_from('<I', data, it_pos + 8)[0]
+                t_mhods = struct.unpack_from('<I', data, it_pos + 12)[0]
                 track_id = struct.unpack_from('<I', data, it_pos + 16)[0]
 
                 dbid = 0
                 if t_hdr >= 120:
                     dbid = struct.unpack_from('<Q', data, it_pos + 112)[0]
 
+                # Parse mhod children for artist/album strings
+                artist = ""
+                album = ""
+                mhod_pos = it_pos + t_hdr
+                for _ in range(t_mhods):
+                    if mhod_pos + 16 > it_pos + t_total:
+                        break
+                    if data[mhod_pos:mhod_pos+4] != b'mhod':
+                        break
+                    m_hdr = struct.unpack_from('<I', data, mhod_pos + 4)[0]
+                    m_total = struct.unpack_from('<I', data, mhod_pos + 8)[0]
+                    m_type = struct.unpack_from('<I', data, mhod_pos + 12)[0]
+
+                    # String mhod types: 1=title, 2=path, 3=album, 4=artist
+                    if m_type in (3, 4) and m_total > 40:
+                        s = _parse_mhod_string(data, mhod_pos, m_total)
+                        if m_type == 3:
+                            album = s
+                        elif m_type == 4:
+                            artist = s
+
+                    mhod_pos += m_total
+
                 tracks.append({
                     'track_id': track_id,
                     'dbid': dbid,
+                    'artist': artist,
+                    'album': album,
                 })
                 it_pos += t_total
             break
@@ -88,6 +119,38 @@ def parse_itunesdb_dbids(ipod_drive: Path) -> list:
         pos += s_total
 
     return tracks
+
+
+def _parse_mhod_string(data: bytes, mhod_pos: int, m_total: int) -> str:
+    """Parse a string value from an iTunesDB mhod record.
+
+    iTunesDB string mhod layout (types 1-14):
+      +0:  'mhod' tag
+      +4:  header_size (24)
+      +8:  total_size
+      +12: type
+      +24: unknown (position)
+      +28: string_byte_length
+      +32: unknown
+      +36: unknown
+      +40: string data (UTF-16LE or UTF-8)
+
+    Returns the decoded string, or empty string on error.
+    """
+    try:
+        str_len = struct.unpack_from('<I', data, mhod_pos + 28)[0]
+        if str_len <= 0 or str_len > m_total - 40:
+            return ""
+        str_bytes = data[mhod_pos + 40 : mhod_pos + 40 + str_len]
+        # Try UTF-16LE first (most common), fall back to UTF-8
+        if str_len >= 2 and str_len % 2 == 0:
+            try:
+                return str_bytes.decode('utf-16-le')
+            except UnicodeDecodeError:
+                pass
+        return str_bytes.decode('utf-8', errors='replace')
+    except (struct.error, IndexError):
+        return ""
 
 
 class ArtworkDB:
