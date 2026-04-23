@@ -155,6 +155,13 @@
                     <span class="setting-label" style="margin:0;">EMBED ART</span>
                 </label>
             </div>
+            <div class="setting-row" style="margin-top:4px; margin-bottom:0;">
+                <label class="setting-check" id="fix-art-toggle-label">
+                    <input type="checkbox" id="fix-art-toggle" checked>
+                    <div class="check-box"></div>
+                    <span class="setting-label" style="margin:0;">AUTO FIX ART</span>
+                </label>
+            </div>
             <div class="path-box" id="path-box" style="margin-top:8px;">--- NO FOLDER ---</div>
             <button class="btn" id="btn-browse" onclick="pickFolder()" style="margin-top:10px;">BROWSE FOLDER</button>
             <div class="path-input-row">
@@ -277,6 +284,10 @@
             artLabel.style.pointerEvents = 'auto';
             artInfo.className = 'art-info active';
             artInfo.textContent = `🎨 Album art: ${profile.artSize}×${profile.artSize}px`;
+            // Enable auto-fix toggle
+            document.getElementById('fix-art-toggle').disabled = false;
+            document.getElementById('fix-art-toggle-label').style.opacity = '1';
+            document.getElementById('fix-art-toggle-label').style.pointerEvents = 'auto';
         } else {
             artToggle.checked = false;
             artToggle.disabled = true;
@@ -284,6 +295,11 @@
             artLabel.style.pointerEvents = 'none';
             artInfo.className = 'art-info disabled';
             artInfo.textContent = '🚫 Album art: disabled (mono display)';
+            // Disable auto-fix toggle
+            document.getElementById('fix-art-toggle').checked = false;
+            document.getElementById('fix-art-toggle').disabled = true;
+            document.getElementById('fix-art-toggle-label').style.opacity = '0.4';
+            document.getElementById('fix-art-toggle-label').style.pointerEvents = 'none';
         }
     }
 
@@ -292,13 +308,22 @@
         const profile = DEVICE_PROFILES[device];
         const artInfo = document.getElementById('art-info');
         const checked = document.getElementById('art-toggle').checked;
+        const fixToggle = document.getElementById('fix-art-toggle');
+        const fixLabel = document.getElementById('fix-art-toggle-label');
 
         if (checked && profile.artSupport) {
             artInfo.className = 'art-info active';
             artInfo.textContent = `🎨 Album art: ${profile.artSize}×${profile.artSize}px`;
+            fixToggle.disabled = false;
+            fixLabel.style.opacity = '1';
+            fixLabel.style.pointerEvents = 'auto';
         } else {
             artInfo.className = 'art-info disabled';
             artInfo.textContent = checked ? `🎨 Album art: ${profile.artSize}×${profile.artSize}px` : '🚫 Album art: disabled';
+            fixToggle.checked = false;
+            fixToggle.disabled = true;
+            fixLabel.style.opacity = '0.4';
+            fixLabel.style.pointerEvents = 'none';
         }
     }
 
@@ -499,7 +524,8 @@
         const workers = document.getElementById('threads-select').value;
         const device = document.getElementById('device-select').value;
         const embedArt = document.getElementById('art-toggle').checked;
-        await executeStream('/api/sync', {folder: selectedPath, bitrate: parseInt(bitrate), workers: parseInt(workers), device: device, embed_art: embedArt});
+        const fixArtAfterSync = document.getElementById('fix-art-toggle').checked;
+        await executeStream('/api/sync', {folder: selectedPath, bitrate: parseInt(bitrate), workers: parseInt(workers), device: device, embed_art: embedArt, fix_art_after_sync: fixArtAfterSync});
 
         // Revert button
         btn.textContent = 'LAUNCH SYNC';

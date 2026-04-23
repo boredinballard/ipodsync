@@ -5,6 +5,7 @@ from tkinter import filedialog
 from pathlib import Path
 from flask import Flask, request, jsonify, Response, stream_with_context
 from network_utils import normalize_path, is_network_path, validate_path as validate_path_util, safe_resolve
+from artworkdb_writer import ArtworkDB as ArtworkDBWriter, parse_itunesdb_dbids
 
 try:
     import win32com.client
@@ -82,6 +83,25 @@ def get_ipod():
             if source.Kind == 2: return itunes, source
     except: pass
     return None, None
+
+def find_ipod_drive():
+    """Scan removable drives for iPod_Control folder to find iPod mount point.
+    Returns the drive letter path (e.g. Path('E:/')) or None."""
+    import ctypes
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    for letter_idx in range(26):
+        if bitmask & (1 << letter_idx):
+            drive = f"{chr(65 + letter_idx)}:\\"
+            try:
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
+                # 2 = removable, 3 = fixed (some iPods mount as fixed)
+                if drive_type in (2, 3):
+                    ipod_ctrl = Path(drive) / "iPod_Control"
+                    if ipod_ctrl.is_dir():
+                        return Path(drive)
+            except:
+                continue
+    return None
 
 def slugify(name: str) -> str:
     slug = name.lower()
@@ -190,6 +210,7 @@ def extract_album_art(p: Path) -> tuple[bytes | None, str]:
 
     Returns (image_bytes, source_description) where source_description indicates
     where the artwork came from (e.g. 'cover.jpg', 'embedded:FLAC', etc.).
+    All filename matching is case-insensitive.
     """
     # 1. Check parent folder for images first (case-insensitive)
     # Build a lookup of lowercased filename -> actual path for the directory
@@ -197,11 +218,25 @@ def extract_album_art(p: Path) -> tuple[bytes | None, str]:
         folder_files = {f.name.lower(): f for f in p.parent.iterdir() if f.is_file()}
     except OSError:
         folder_files = {}
-    for img_name in ['cover.jpg', 'folder.jpg', 'cover.png', 'folder.png', 'front.jpg']:
+
+    # 1a. Well-known cover image names (includes .jpeg variants)
+    for img_name in ['cover.jpg', 'cover.jpeg', 'folder.jpg', 'folder.jpeg',
+                     'cover.png', 'folder.png', 'front.jpg', 'front.jpeg',
+                     'front.png', 'album.jpg', 'album.jpeg', 'album.png',
+                     'albumart.jpg', 'albumartsmall.jpg', 'thumb.jpg']:
         match = folder_files.get(img_name)
         if match:
             try:
                 return match.read_bytes(), f"file:{match.name}"
+            except Exception:
+                pass
+
+    # 1b. Fallback: any .jpg/.jpeg/.png file larger than 10KB in the folder
+    for fname, fpath in folder_files.items():
+        if fname.endswith(('.jpg', '.jpeg', '.png')):
+            try:
+                if fpath.stat().st_size > 10000:
+                    return fpath.read_bytes(), f"file:{fpath.name}"
             except Exception:
                 pass
 
@@ -456,6 +491,7 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
 
     # Extract and resize album art from source before conversion (skip if art_size is None)
     artwork_data = None
+    raw_art = None  # Raw bytes before resize — saved for post-sync artwork pass
     art_diag = None  # Diagnostic info for logging
     if art_size is not None:
         extract_result = read_with_retry(extract_album_art, audio)
@@ -481,6 +517,8 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
         else:
             art_diag = "no artwork found"
     result["art_diag"] = art_diag
+    # Store raw artwork bytes for post-sync AddArtworkFromFile pass
+    result["artwork_raw"] = raw_art
 
     # Bail early if cancelled
     if cancel_event.is_set():
@@ -596,6 +634,7 @@ def sync():
     workers = max(1, min(16, int(data.get("workers", CONVERSION_WORKERS))))  # Clamp 1-16
     device_key = data.get("device", "5gen")
     embed_art = data.get("embed_art", True)
+    fix_art_after_sync = data.get("fix_art_after_sync", True)  # Auto-apply artwork via AddArtworkFromFile
     
     # Resolve device profile for art sizing
     device_profile = DEVICE_PROFILES.get(device_key, DEVICE_PROFILES['5gen'])
@@ -648,6 +687,11 @@ def sync():
             transfers = 0
             skipped = 0
             errors = 0
+            # --- Post-sync artwork tracking ---
+            # Collect raw artwork per album for direct ArtworkDB generation.
+            # We build the iPod's artwork database (.ithmb + ArtworkDB)
+            # directly on the filesystem, bypassing iTunes COM entirely.
+            album_art_map = {}          # {(artist_lower, album_lower): raw_artwork_bytes}
             pending_ops = []  # IITOperationStatus objects from AddFile()
 
             # --- Helper: reconnect COM to iTunes/iPod ---
@@ -793,6 +837,12 @@ def sync():
                     time.sleep(0.3)
                     transfers += 1
 
+                    # --- Track artwork per album for direct ArtworkDB generation ---
+                    if fix_art_after_sync and art_size is not None:
+                        art_key = (artist_name.lower().strip(), album_name.lower().strip())
+                        if art_key not in album_art_map and result.get("artwork_raw"):
+                            album_art_map[art_key] = result["artwork_raw"]
+
             if transfers == 0 and skipped > 0 and errors == 0:
                 yield log("✅ All files already on iPod, nothing to sync.")
 
@@ -858,10 +908,93 @@ def sync():
                     if elapsed % 15 == 0 and pending_ops:
                         yield log(f"⏳ Stabilizing — {len(pending_ops)} ops pending ({elapsed}s)")
 
+            # --- Direct artwork generation pass ---
+            # Build ArtworkDB + .ithmb files directly on iPod filesystem,
+            # completely bypassing iTunes COM for artwork.
+            art_applied = 0
+            if fix_art_after_sync and art_size is not None and transfers > 0 and album_art_map and not cancelled:
+                yield log(f"🎨 Generating artwork database for {len(album_art_map)} albums...")
+
+                ipod_drive = find_ipod_drive()
+                if not ipod_drive:
+                    yield log("  ❌ Could not locate iPod drive — skipping artwork generation.")
+                else:
+                    try:
+                        # Parse iTunesDB to get persistent 8-byte dbids for all tracks
+                        yield log("  📋 Reading track database IDs from iTunesDB...")
+                        itdb_tracks = parse_itunesdb_dbids(ipod_drive)
+                        if not itdb_tracks:
+                            yield log("  ❌ Could not parse iTunesDB — skipping artwork.")
+                        else:
+                            yield log(f"  📋 Found {len(itdb_tracks)} tracks in iTunesDB")
+
+                            # Re-read iPod library via COM to get artist/album metadata
+                            # and map each track's COM index to its iTunesDB dbid
+                            yield log("  🔄 Refreshing COM connection to map tracks...")
+                            time.sleep(2)
+                            if not reconnect_com():
+                                yield log("  ❌ Lost iPod connection — skipping artwork.")
+                            else:
+                                # Build {index: dbid} mapping via COM track order
+                                # COM tracks are in the same order as iTunesDB mhit entries
+                                total_ipod = lib.Tracks.Count
+                                if total_ipod != len(itdb_tracks):
+                                    yield log(f"  ⚠️ Track count mismatch: COM={total_ipod} vs iTunesDB={len(itdb_tracks)}")
+
+                                # Build the ArtworkDB
+                                artwork_db = ArtworkDBWriter()
+                                tracks_with_art = 0
+                                tracks_no_art = 0
+
+                                for i in range(1, min(total_ipod, len(itdb_tracks)) + 1):
+                                    try:
+                                        t = lib.Tracks.Item(i)
+                                        t_artist = (t.Artist or "").lower().strip()
+                                        t_album = (t.Album or "").lower().strip()
+                                        album_key = (t_artist, t_album)
+                                        dbid = itdb_tracks[i - 1]['dbid']
+
+                                        raw_art = album_art_map.get(album_key)
+                                        if not raw_art:
+                                            # Try source folder for albums not in map
+                                            raw_art = _find_source_artwork(folder, t_artist, t_album, verbose=False)
+
+                                        if raw_art and dbid:
+                                            img = Image.open(io.BytesIO(raw_art)).convert('RGB')
+                                            artwork_db.add_artwork(dbid, img)
+                                            tracks_with_art += 1
+                                        else:
+                                            tracks_no_art += 1
+                                    except Exception:
+                                        tracks_no_art += 1
+
+                                if tracks_with_art > 0:
+                                    # Write ArtworkDB + .ithmb files to iPod
+                                    artwork_dir = ipod_drive / "iPod_Control" / "Artwork"
+                                    yield log(f"  💾 Writing artwork: {tracks_with_art} tracks, {artwork_db._next_image_id - 101} unique images...")
+                                    stats = artwork_db.write(artwork_dir)
+                                    art_applied = tracks_with_art
+                                    yield log(f"  ✅ Artwork database written: {stats['db_size']//1024}KB ArtworkDB")
+                                    for fname, fsize in stats['ithmb_files'].items():
+                                        yield log(f"     {fname}: {fsize//1024}KB")
+                                else:
+                                    yield log("  ⚠️ No artwork found for any tracks.")
+
+                                if tracks_no_art > 0:
+                                    yield log(f"  ℹ️ {tracks_no_art} tracks had no artwork available")
+
+                    except Exception as art_err:
+                        yield log(f"  ❌ Artwork generation error: {art_err}")
+                        import traceback as tb_mod
+                        for line in tb_mod.format_exc().strip().splitlines():
+                            yield log(f"    📋 {line}")
+
             # --- Summary ---
             summary_parts = [f"{transfers} synced"]
             if skipped > 0:
                 summary_parts.append(f"{skipped} already on iPod")
+            if art_applied > 0:
+                summary_parts.append(f"{art_applied} artwork applied")
             if errors > 0:
                 summary_parts.append(f"{errors} error{'s' if errors != 1 else ''}")
             summary = ", ".join(summary_parts)
@@ -885,14 +1018,13 @@ def sync():
 
 @app.route("/api/fix-artwork", methods=["POST"])
 def fix_artwork():
-    """Scan all iPod tracks and re-encode problematic album art.
+    """Rebuild iPod artwork database directly on the filesystem.
 
-    Detects progressive JPEGs, oversized images, non-square dimensions,
-    and non-JPEG formats, then re-encodes them through the iPod-compatible
-    baseline JPEG pipeline.  Streams progress as SSE events.
+    Generates ArtworkDB + .ithmb thumbnail files by matching iPod tracks
+    to source folder artwork, completely bypassing iTunes COM for artwork.
+    Streams progress as SSE events.
 
-    If a source_folder is provided, also attempts to find and add artwork
-    for tracks that currently have none.
+    Requires a source_folder to find artwork files.
     """
     global is_busy
     is_busy = True
@@ -906,7 +1038,6 @@ def fix_artwork():
     def generate():
         global is_busy
         log = lambda m: f"data: {m}\n\n"
-        temp_dir = None
         cancelled = False
         try:
             if art_size is None:
@@ -914,197 +1045,113 @@ def fix_artwork():
                 return
 
             art_label = f"{art_size[0]}×{art_size[1]}px"
-            yield log(f"🎨 Fix Artwork — Device: {device_profile['name']} | Target: {art_label}")
+            yield log(f"🎨 Fix Artwork (Direct Generation) — Device: {device_profile['name']} | Target: {art_label}")
 
-            # Source folder for missing-art lookups (optional)
+            # Source folder for artwork lookups
             src_folder = None
             if source_folder:
                 src_folder = normalize_path(source_folder)
                 check = validate_path_util(src_folder)
                 if check["reachable"]:
-                    yield log(f"📂 Source folder set: {src_folder} — will attempt to add missing artwork")
+                    yield log(f"📂 Source folder: {src_folder}")
                 else:
-                    yield log(f"⚠️ Source folder unreachable ({source_folder}), skipping missing-art lookups")
+                    yield log(f"⚠️ Source folder unreachable ({source_folder})")
                     src_folder = None
-            else:
-                yield log("ℹ️ No source folder set — tracks with no artwork will be skipped")
+            if not src_folder:
+                yield log("ℹ️ No source folder — will skip tracks without artwork")
 
+            # Step 1: Find iPod drive
+            ipod_drive = find_ipod_drive()
+            if not ipod_drive:
+                yield log("❌ Could not locate iPod drive.")
+                return
+
+            # Step 2: Parse iTunesDB for persistent dbids
+            yield log("📋 Reading track database IDs from iTunesDB...")
+            itdb_tracks = parse_itunesdb_dbids(ipod_drive)
+            if not itdb_tracks:
+                yield log("❌ Could not parse iTunesDB.")
+                return
+            yield log(f"📋 Found {len(itdb_tracks)} tracks in iTunesDB")
+
+            # Step 3: Get track metadata via COM
+            pythoncom.CoInitialize()
             itunes, ipod = get_ipod()
             if not ipod:
-                yield log("❌ iPod not found.")
+                yield log("❌ iPod not found via iTunes.")
                 return
 
             lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
             total = lib.Tracks.Count
             yield log(f"🔍 Scanning {total} tracks on iPod...")
 
-            temp_dir = Path(tempfile.mkdtemp(prefix="ipodsync_fixart_"))
+            if total != len(itdb_tracks):
+                yield log(f"⚠️ Track count mismatch: COM={total} vs iTunesDB={len(itdb_tracks)}")
 
-            fixed = 0
-            already_ok = 0
-            no_art = 0
-            added = 0
+            # Step 4: Match tracks to artwork and build ArtworkDB
+            artwork_db = ArtworkDBWriter()
+            tracks_with_art = 0
+            tracks_no_art = 0
             errors = 0
 
-            # --- COM reconnect helper (same pattern as sync) ---
-            COM_RECONNECT_INTERVAL = 200
-
-            def reconnect_com():
-                nonlocal itunes, ipod, lib
-                try:
-                    pythoncom.CoUninitialize()
-                except:
-                    pass
-                pythoncom.CoInitialize()
-                itunes = win32com.client.Dispatch("iTunes.Application")
-                ipod = None
-                for source in itunes.Sources:
-                    if source.Kind == 2:
-                        ipod = source
-                        break
-                if ipod:
-                    lib = next(pl for pl in ipod.Playlists if pl.Kind == 1)
-                return ipod is not None
-
-            processed = 0
-            # Reuse a single pair of temp files to avoid filesystem overhead
-            export_path = temp_dir / "export.tmp"
-            fixed_path = temp_dir / "fixed.jpg"
-            add_path = temp_dir / "add.jpg"
-            PROGRESS_INTERVAL = 100  # Report batch progress every N tracks
-
-            for i in range(1, total + 1):
+            for i in range(1, min(total, len(itdb_tracks)) + 1):
                 if cancel_event.is_set():
                     cancelled = True
-                    yield log(f"⏹ Cancelled at track {i}/{total}.")
                     break
 
-                tag = f"[{i}/{total}]"
                 try:
                     t = lib.Tracks.Item(i)
-                    art_count = t.Artwork.Count
+                    artist = t.Artist or "Unknown"
+                    album = t.Album or "Unknown"
+                    dbid = itdb_tracks[i - 1]['dbid']
 
-                    if art_count == 0:
-                        # --- No existing artwork on iPod ---
-                        artist = t.Artist or "Unknown"
-                        album = t.Album or "Unknown"
-                        name = t.Name or "Untitled"
-                        if src_folder:
-                            # Try to find artwork from source folder
-                            source_art, search_log = _find_source_artwork(src_folder, artist, album, verbose=True)
-                            if source_art:
-                                try:
-                                    issues = detect_artwork_issues(source_art, art_size)
-                                    processed_art = resize_album_art(source_art, size=art_size)
-                                    add_path.write_bytes(processed_art)
-                                    w, h = issues["original_size"]
-                                    flags = ", ".join(issues["details"]) if issues["details"] else "OK"
-                                    try:
-                                        t.AddArtworkFromFile(str(add_path))
-                                        added += 1
-                                        yield log(f"  {tag} ➕ Added: {artist} / {album} ({w}×{h} {flags} → {art_size[0]}×{art_size[1]})")
-                                    except Exception as e:
-                                        yield log(f"  {tag} ⚠️ COM add failed: {artist} / {album} — {e}")
-                                        errors += 1
-                                except Exception as e:
-                                    yield log(f"  {tag} ⚠️ Art processing failed: {artist} / {album} — {e}")
-                                    errors += 1
-                            else:
-                                no_art += 1
-                                yield log(f"  {tag} 🔍 No art found: {artist} / {album} — {search_log}")
-                        else:
-                            no_art += 1
-                        processed += 1
+                    raw_art = None
+                    if src_folder:
+                        raw_art = _find_source_artwork(src_folder, artist, album, verbose=False)
 
+                    if raw_art and dbid:
+                        img = Image.open(io.BytesIO(raw_art)).convert('RGB')
+                        artwork_db.add_artwork(dbid, img)
+                        tracks_with_art += 1
                     else:
-                        # --- Has artwork — check if it needs fixing ---
-                        artwork_obj = t.Artwork.Item(1)
-                        exported = False
-                        for attempt in range(3):
-                            try:
-                                artwork_obj.SaveArtworkToFile(str(export_path))
-                                exported = True
-                                break
-                            except Exception:
-                                if attempt < 2:
-                                    time.sleep(0.5 * (attempt + 1))
-                                    try:
-                                        artwork_obj = t.Artwork.Item(1)
-                                    except:
-                                        pass
-                        if not exported:
-                            artist = t.Artist or "Unknown"
-                            album = t.Album or "Unknown"
-                            yield log(f"  {tag} ⚠️ Could not export artwork: {artist} / {album} (skipped after 3 attempts)")
-                            errors += 1
-                            processed += 1
-                            continue
-
-                        raw_data = export_path.read_bytes()
-                        issues = detect_artwork_issues(raw_data, art_size)
-
-                        if not issues["needs_fix"]:
-                            already_ok += 1
-                            processed += 1
-                        else:
-                            # --- Fix the artwork ---
-                            artist = t.Artist or "Unknown"
-                            album = t.Album or "Unknown"
-                            name = t.Name or "Untitled"
-                            issue_desc = ", ".join(issues["details"])
-                            w, h = issues["original_size"]
-                            processed_art = resize_album_art(raw_data, size=art_size)
-                            fixed_path.write_bytes(processed_art)
-
-                            replaced = False
-                            for attempt in range(3):
-                                try:
-                                    artwork_obj.Delete()
-                                    t.AddArtworkFromFile(str(fixed_path))
-                                    replaced = True
-                                    break
-                                except Exception:
-                                    if attempt < 2:
-                                        time.sleep(0.5 * (attempt + 1))
-                            if replaced:
-                                fixed += 1
-                                yield log(f"  {tag} ✅ Fixed: {artist} / {album} / {name} ({w}×{h} {issue_desc} → {art_size[0]}×{art_size[1]})")
-                            else:
-                                yield log(f"  {tag} ❌ Failed to replace: {artist} / {album} / {name}")
-                                errors += 1
-
-                            processed += 1
-
-                    # --- Periodic progress report (for non-logged tracks) ---
-                    if processed > 0 and processed % PROGRESS_INTERVAL == 0:
-                        yield log(f"  ⏳ Progress: {processed}/{total} scanned — {fixed} fixed, {added} added, {already_ok} OK, {no_art} no art")
-
-                    # --- Proactive COM reconnect ---
-                    if processed > 0 and processed % COM_RECONNECT_INTERVAL == 0:
-                        yield log(f"  🔄 Refreshing iTunes connection ({processed} tracks)...")
-                        time.sleep(1)
-                        if reconnect_com():
-                            total = lib.Tracks.Count
-                            yield log(f"  ✅ Connection refreshed.")
-                        else:
-                            yield log(f"  ❌ Lost iPod connection after refresh!")
-                            break
-
-                except Exception as e:
-                    yield log(f"  {tag} ❌ Error: {e}")
+                        tracks_no_art += 1
+                except Exception:
                     errors += 1
-                    processed += 1
 
-            # --- Summary ---
+                if i % 50 == 0:
+                    yield log(f"  ⏳ Processed {i}/{min(total, len(itdb_tracks))} tracks...")
+
+            if cancelled:
+                yield log("⏹ Cancelled during scan.")
+            elif tracks_with_art > 0:
+                # Clear existing artwork
+                artwork_dir = ipod_drive / "iPod_Control" / "Artwork"
+                if artwork_dir.is_dir():
+                    existing = list(artwork_dir.glob("*"))
+                    if existing:
+                        yield log(f"🗑️ Clearing {len(existing)} existing artwork files...")
+                        for f in existing:
+                            try:
+                                f.unlink()
+                            except Exception:
+                                pass
+
+                # Write new artwork database
+                unique_count = artwork_db._next_image_id - 101
+                yield log(f"💾 Writing artwork: {tracks_with_art} tracks, {unique_count} unique images...")
+                stats = artwork_db.write(artwork_dir)
+                yield log(f"✅ Artwork database written: {stats['db_size']//1024}KB ArtworkDB")
+                for fname, fsize in stats['ithmb_files'].items():
+                    yield log(f"   {fname}: {fsize//1024}KB")
+            else:
+                yield log("⚠️ No artwork found for any tracks.")
+
+            # Summary
             summary_parts = []
-            if fixed > 0:
-                summary_parts.append(f"{fixed} fixed")
-            if added > 0:
-                summary_parts.append(f"{added} added")
-            if already_ok > 0:
-                summary_parts.append(f"{already_ok} already OK")
-            if no_art > 0:
-                summary_parts.append(f"{no_art} no artwork")
+            if tracks_with_art > 0:
+                summary_parts.append(f"{tracks_with_art} artwork applied")
+            if tracks_no_art > 0:
+                summary_parts.append(f"{tracks_no_art} no artwork")
             if errors > 0:
                 summary_parts.append(f"{errors} error{'s' if errors != 1 else ''}")
             summary = ", ".join(summary_parts) if summary_parts else "nothing to process"
@@ -1120,11 +1167,12 @@ def fix_artwork():
             for line in tb.strip().splitlines():
                 yield log(f"  📋 {line}")
         finally:
-            if temp_dir and temp_dir.exists():
-                shutil.rmtree(temp_dir, ignore_errors=True)
             cancel_event.clear()
             is_busy = False
-            pythoncom.CoUninitialize()
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
