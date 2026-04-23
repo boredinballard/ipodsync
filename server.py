@@ -912,8 +912,9 @@ def sync():
             # Build ArtworkDB + .ithmb files directly on iPod filesystem,
             # completely bypassing iTunes COM for artwork.
             art_applied = 0
-            if fix_art_after_sync and art_size is not None and transfers > 0 and album_art_map and not cancelled:
-                yield log(f"🎨 Generating artwork database for {len(album_art_map)} albums...")
+            if fix_art_after_sync and art_size is not None and transfers > 0 and album_art_map:
+                status = "partial" if cancelled else "full"
+                yield log(f"🎨 Generating artwork database for {len(album_art_map)} albums ({status} sync)...")
 
                 ipod_drive = find_ipod_drive()
                 if not ipod_drive:
