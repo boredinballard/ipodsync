@@ -955,8 +955,10 @@ def sync():
                                 album_key = (t_artist, t_album)
 
                                 raw_art = album_art_map.get(album_key)
-                                if not raw_art:
-                                    # Check cache before expensive filesystem scan
+                                if not raw_art and not cancelled:
+                                    # Check cache before expensive filesystem scan.
+                                    # Skip if sync was cancelled to avoid slow network I/O —
+                                    # only use artwork already cached from the sync loop.
                                     if album_key not in source_art_cache:
                                         source_art_cache[album_key] = _find_source_artwork(
                                             folder, t_artist, t_album, verbose=False)
