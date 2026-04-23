@@ -922,18 +922,31 @@ def sync():
                     yield log("  ❌ Could not locate iPod drive — skipping artwork generation.")
                 else:
                     try:
-                        # Parse iTunesDB for dbids + artist/album (binary only, no COM)
+                        # Parse iTunesDB for dbids + artist/album (binary only, no COM).
+                        # Retry with delay — iTunes may not have flushed the database
+                        # to disk yet after AddFile() transfers complete.
                         yield log("  📋 Reading track metadata from iTunesDB...")
-                        itdb_tracks = parse_itunesdb_dbids(ipod_drive)
+                        itdb_tracks = []
+                        for attempt in range(5):
+                            itdb_tracks = parse_itunesdb_dbids(ipod_drive)
+                            if itdb_tracks:
+                                break
+                            wait = 3 * (attempt + 1)
+                            yield log(f"  ⏳ iTunesDB not ready, retrying in {wait}s... (attempt {attempt+1}/5)")
+                            time.sleep(wait)
+
                         if not itdb_tracks:
-                            yield log("  ❌ Could not parse iTunesDB — skipping artwork.")
+                            yield log("  ❌ Could not parse iTunesDB after retries — skipping artwork.")
                         else:
                             yield log(f"  📋 Found {len(itdb_tracks)} tracks in iTunesDB")
 
-                            # Match tracks to artwork using binary-parsed artist/album
+                            # Match tracks to artwork using binary-parsed artist/album.
+                            # Cache source artwork lookups per album to avoid repeated
+                            # slow filesystem scans for the same album.
                             artwork_db = ArtworkDBWriter()
                             tracks_with_art = 0
                             tracks_no_art = 0
+                            source_art_cache = {}  # album_key -> raw_art or None
 
                             for t in itdb_tracks:
                                 dbid = t['dbid']
@@ -943,7 +956,11 @@ def sync():
 
                                 raw_art = album_art_map.get(album_key)
                                 if not raw_art:
-                                    raw_art = _find_source_artwork(folder, t_artist, t_album, verbose=False)
+                                    # Check cache before expensive filesystem scan
+                                    if album_key not in source_art_cache:
+                                        source_art_cache[album_key] = _find_source_artwork(
+                                            folder, t_artist, t_album, verbose=False)
+                                    raw_art = source_art_cache[album_key]
 
                                 if raw_art and dbid:
                                     try:
