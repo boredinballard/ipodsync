@@ -889,10 +889,11 @@ def sync():
                 yield log("🔌 Done.")
 
             elif transfers > 0 and cancelled:
-                # Give in-flight transfers a chance to finish
+                # Brief stabilization for iTunesDB flush — don't wait for
+                # all pending transfers (they'll finish in background).
                 yield log("💾 Stabilizing iPod after partial sync...")
                 POLL_INTERVAL = 3
-                MAX_WAIT = 300
+                MAX_WAIT = 30  # Short wait — just enough for iTunesDB flush
                 elapsed = 0
                 while elapsed < MAX_WAIT and pending_ops:
                     time.sleep(POLL_INTERVAL)
@@ -905,8 +906,10 @@ def sync():
                         except:
                             pass
                     pending_ops = still_pending
-                    if elapsed % 15 == 0 and pending_ops:
-                        yield log(f"⏳ Stabilizing — {len(pending_ops)} ops pending ({elapsed}s)")
+                if pending_ops:
+                    yield log(f"  ℹ️ {len(pending_ops)} transfers still in background — artwork will cover synced tracks.")
+                else:
+                    yield log("🔌 All transfers complete.")
 
             # --- Direct artwork generation pass ---
             # Build ArtworkDB + .ithmb files directly on iPod filesystem.
