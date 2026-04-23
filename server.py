@@ -1178,6 +1178,21 @@ def fix_artwork():
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
 
+# Cache for source folder directory listings to avoid repeated slow network scans.
+# Key: str(folder), Value: list of Path entries that are directories.
+_src_dir_cache = {}
+
+def _get_cached_src_dirs(folder: Path) -> list:
+    """Return cached list of subdirectories in folder. Scans once per path."""
+    key = str(folder)
+    if key not in _src_dir_cache:
+        _src_dir_cache[key] = [e for e in folder.iterdir() if e.is_dir()]
+    return _src_dir_cache[key]
+
+def _clear_src_dir_cache():
+    """Clear the source directory cache (call at start of new sync/fix)."""
+    _src_dir_cache.clear()
+
 def _find_source_artwork(src_folder: Path, artist: str, album: str, verbose: bool = False):
     """Try to find album art in the source folder by matching artist/album directory structure.
 
@@ -1195,9 +1210,10 @@ def _find_source_artwork(src_folder: Path, artist: str, album: str, verbose: boo
     search_log = []
 
     # --- Step 1: Find matching artist directory ---
+    # Cache the top-level directory listing to avoid repeated network scans.
     matched_artist_dirs = []
     try:
-        all_dirs = [e for e in src_folder.iterdir() if e.is_dir()]
+        all_dirs = _get_cached_src_dirs(src_folder)
         search_log.append(f"scanned {len(all_dirs)} top dirs")
         for entry in all_dirs:
             name = entry.name
@@ -1226,9 +1242,7 @@ def _find_source_artwork(src_folder: Path, artist: str, album: str, verbose: boo
     for artist_dir in matched_artist_dirs:
         matched_album_dirs = []
         try:
-            for entry in artist_dir.iterdir():
-                if not entry.is_dir():
-                    continue
+            for entry in _get_cached_src_dirs(artist_dir):
                 name = entry.name
                 name_lower = name.lower()
                 stripped = strip_year(name).lower()
