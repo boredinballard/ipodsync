@@ -528,6 +528,11 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
     temp_subdir = temp_dir / slugify(artist_name) / slugify(album_name)
     temp_subdir.mkdir(parents=True, exist_ok=True)
 
+    # Check cancel again before expensive file I/O (copy/conversion)
+    if cancel_event.is_set():
+        result["error"] = "cancelled"
+        return result
+
     if ext in CONVERT_EXTENSIONS:
         # Formats that need FFmpeg conversion to MP3 (FLAC, WAV, AIFF, ALAC)
         if not ffmpeg_ok.is_set():
@@ -552,12 +557,18 @@ def prepare_file(audio: Path, temp_dir: Path, folder: Path, cancel_event: thread
     elif ext in ('.aac', '.m4a'):
         # AAC/M4A — iPod-native, copy and retag with MP4 atoms
         final_path = temp_subdir / f"{new_stem}{ext}"
+        if cancel_event.is_set():
+            result["error"] = "cancelled"
+            return result
         buffered_copy(audio, final_path)
         clean_tags_m4a(final_path, new_stem, artist_name, album_name, track_number, artwork_data, year)
     else:
         # MP3 — copy to temp dir (never modify source folder)
         # Uses buffered copy for better throughput over network shares
         final_path = temp_subdir / f"{new_stem}.mp3"
+        if cancel_event.is_set():
+            result["error"] = "cancelled"
+            return result
         buffered_copy(audio, final_path)
         # Tag the file (mutagen, no COM) — preserve original track number and album art
         clean_tags(final_path, new_stem, artist_name, album_name, track_number, artwork_data, year)
@@ -726,7 +737,8 @@ def sync():
             ffmpeg_ok.set()  # Assume FFmpeg is available until proven otherwise
             yield log(f"⚡ Starting pipeline ({workers} workers, {total} files, {bitrate}kbps)...")
 
-            with ThreadPoolExecutor(max_workers=workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=workers)
+            try:
                 # Submit ALL files — workers will self-filter duplicates
                 future_list = []  # [(future, idx, audio), ...] — maintains submission order
                 for idx, audio in enumerate(audio_files, 1):
@@ -842,6 +854,10 @@ def sync():
                         art_key = (artist_name.lower().strip(), album_name.lower().strip())
                         if art_key not in album_art_map and result.get("artwork_raw"):
                             album_art_map[art_key] = result["artwork_raw"]
+
+            finally:
+                # Shut down executor — don't wait for workers if cancelled
+                executor.shutdown(wait=not cancelled, cancel_futures=True)
 
             if transfers == 0 and skipped > 0 and errors == 0:
                 yield log("✅ All files already on iPod, nothing to sync.")
