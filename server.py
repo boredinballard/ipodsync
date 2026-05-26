@@ -5,7 +5,8 @@ from tkinter import filedialog
 from pathlib import Path
 from flask import Flask, request, jsonify, Response, stream_with_context
 from network_utils import normalize_path, is_network_path, validate_path as validate_path_util, safe_resolve
-from artworkdb_writer import ArtworkDB as ArtworkDBWriter, parse_itunesdb_dbids
+from artworkdb_writer import ArtworkDB as ArtworkDBWriter, parse_itunesdb_dbids, read_itunesdb_artwork_refs
+from ithmb_writer import IPOD_5G_FORMATS, IPOD_CLASSIC_FORMATS
 
 try:
     import win32com.client
@@ -38,6 +39,16 @@ DEVICE_PROFILES = {
     'classic':    {'name': 'iPod Classic',          'art_size': (500, 500)},
     '4gen-mono':  {'name': 'iPod 4th Gen (Mono)',   'art_size': None},       # Mono screen
     '4gen-color': {'name': 'iPod 4th Gen (Color)',  'art_size': (400, 400)},
+}
+
+# Map device keys to iPod artwork format definitions.
+# Each entry is a dict of {format_id: (width, height, bytes_per_pixel)}.
+# Devices without artwork support (art_size=None) are omitted.
+DEVICE_ARTWORK_FORMATS = {
+    '5gen':       IPOD_5G_FORMATS,
+    'classic':    IPOD_CLASSIC_FORMATS,
+    'nano':       IPOD_5G_FORMATS,       # Nano 1G/2G use same format IDs as 5G
+    '4gen-color': IPOD_5G_FORMATS,       # 4G Color uses same format IDs
 }
 
 app = Flask(__name__)
@@ -962,7 +973,18 @@ def sync():
                             # Match tracks to artwork using binary-parsed artist/album.
                             # Cache source artwork lookups per album to avoid repeated
                             # slow filesystem scans for the same album.
-                            artwork_db = ArtworkDBWriter()
+                            device_formats = DEVICE_ARTWORK_FORMATS.get(device_key)
+
+                            # Classic 6G: read existing artwork refs from iTunesDB
+                            # so the writer uses the same image_ids the firmware expects.
+                            # (4th/5th gen match by dbid directly, no refs needed.)
+                            artwork_refs = {}
+                            if device_key == 'classic':
+                                artwork_refs = read_itunesdb_artwork_refs(ipod_drive)
+                                if artwork_refs:
+                                    yield log(f"  🔗 Read {len(set(artwork_refs.values()))} unique artwork refs from iTunesDB")
+
+                            artwork_db = ArtworkDBWriter(formats=device_formats, artwork_refs=artwork_refs)
                             tracks_with_art = 0
                             tracks_no_art = 0
                             source_art_cache = {}  # album_key -> raw_art or None
@@ -1110,7 +1132,16 @@ def fix_artwork():
 
             # Step 3: Match tracks to artwork using binary-parsed metadata
             # (no COM needed — artist/album parsed directly from iTunesDB)
-            artwork_db = ArtworkDBWriter()
+            device_formats = DEVICE_ARTWORK_FORMATS.get(device_key)
+
+            # Classic 6G: read existing artwork refs from iTunesDB
+            artwork_refs = {}
+            if device_key == 'classic':
+                artwork_refs = read_itunesdb_artwork_refs(ipod_drive)
+                if artwork_refs:
+                    yield log(f"🔗 Read {len(set(artwork_refs.values()))} unique artwork refs from iTunesDB")
+
+            artwork_db = ArtworkDBWriter(formats=device_formats, artwork_refs=artwork_refs)
             tracks_with_art = 0
             tracks_no_art = 0
             errors = 0

@@ -1,6 +1,6 @@
 # iPod ArtworkDB Implementation Guide
 
-> A complete reference for generating the iPod's artwork database directly on the filesystem, bypassing iTunes COM entirely. Derived from reverse-engineering a working iPod 5th Gen and verified with hardware testing.
+> A complete reference for generating the iPod's artwork database directly on the filesystem, bypassing iTunes COM entirely. Derived from reverse-engineering working iPod 5th Gen and iPod Classic devices, verified with hardware testing.
 
 ---
 
@@ -14,8 +14,11 @@ iPod_Control/
 │   └── iTunesDB          ← Track database (contains persistent track IDs)
 └── Artwork/
     ├── ArtworkDB          ← Artwork index (maps track IDs → image locations)
-    ├── F1028_1.ithmb      ← Raw pixel data for format 1028 (100×100)
-    └── F1029_1.ithmb      ← Raw pixel data for format 1029 (200×200)
+    ├── F1028_1.ithmb      ← [5G] Raw pixel data for format 1028 (100×100)
+    ├── F1029_1.ithmb      ← [5G] Raw pixel data for format 1029 (200×200)
+    ├── F1055_1.ithmb      ← [Classic] Raw pixel data for format 1055 (128×128)
+    ├── F1060_1.ithmb      ← [Classic] Raw pixel data for format 1060 (320×320)
+    └── F1061_1.ithmb      ← [Classic] Raw pixel data for format 1061 (55×55)
 ```
 
 **Flow**: The firmware reads `ArtworkDB` to find which `.ithmb` file and byte offset contains the thumbnail for a given track. The track is identified by its 8-byte `song_dbid` which matches the persistent ID stored at `mhit+112` in the `iTunesDB`.
@@ -66,13 +69,18 @@ Images must be resized to exactly the target dimensions. Use high-quality resamp
 Total bytes = width × height × 2
 ```
 
-| Format ID | Dimensions | Bytes/Image | Usage |
-|-----------|-----------|-------------|-------|
-| 1028 | 100 × 100 | 20,000 | List view, album grid |
-| 1029 | 200 × 200 | 80,000 | Now Playing (full screen) |
+| Format ID | Dimensions | Bytes/Image | Device | Usage |
+|-----------|-----------|-------------|--------|-------|
+| 1028 | 100 × 100 | 20,000 | 5th Gen | List view, album grid |
+| 1029 | 200 × 200 | 80,000 | 5th Gen | Now Playing (full screen) |
+| 1061 | 55 × 55 | 6,160* | Classic | Tiny thumbnail (list icon) |
+| 1055 | 128 × 128 | 32,768 | Classic | Album list thumbnail |
+| 1060 | 320 × 320 | 204,800 | Classic | Cover Flow / Now Playing |
+
+*Format 1061 uses a stride-padded row: each row is 56 pixels wide in memory (112 bytes) but only 55 pixels are displayed. Total data = 56 × 55 × 2 = 6,160 bytes.
 
 > [!NOTE]
-> These format IDs are specific to iPod 5th/5.5th Gen. Other devices will use different format IDs and dimensions. The `mhlf` section of an existing ArtworkDB can be parsed to discover which formats a device uses.
+> These format IDs are device-specific. The `mhlf` section of an existing ArtworkDB can be parsed to discover which formats a device uses. All supported models use RGB565 LE.
 
 ---
 
@@ -132,7 +140,7 @@ mhfd  (Database header — 132 bytes)
 ```
 
 > [!IMPORTANT]
-> Each `mhii` must have **3 children**: two `mhod type=2` containers (one per format) plus one `mhod type=6`/`mhaf` placeholder. The firmware requires all three.
+> Each `mhii` must have **(N + 1) children**: N `mhod type=2` containers (one per format) plus one `mhod type=6`/`mhaf` placeholder. For 5th Gen (2 formats): 3 children. For Classic (3 formats): 4 children. The firmware requires all of them.
 
 ---
 
@@ -380,12 +388,17 @@ When implementing for a new iPod model:
 
 ### Known Format IDs by Device
 
-| Device | Format IDs (suspected) | Notes |
-|--------|----------------------|-------|
-| iPod 5th/5.5th Gen | 1028 (100×100), 1029 (200×200) | ✅ Verified |
-| iPod Classic | TBD | Likely similar to 5G |
-| iPod Nano | TBD | Smaller display, different format IDs |
-| iPod 4th Gen (Color) | TBD | Older firmware, may use v2 |
+| Device | Format IDs | Pixel Format | Notes |
+|--------|-----------|--------------|-------|
+| iPod 5th/5.5th Gen | 1028 (100×100), 1029 (200×200) | RGB565 LE | ✅ Verified on hardware |
+| iPod Classic (all gens) | 1055 (128×128), 1060 (320×320), 1061 (55×55) | RGB565 LE | ✅ Verified on 160GB Classic |
+| iPod Nano 1G/2G | 1027 (100×100), 1031 (42×42) | RGB565 LE | From libgpod |
+| iPod Nano 3G | Same as Classic | RGB565 LE | From libgpod (shared config) |
+| iPod Nano 4G/5G | 1055 (128×128), 1068 (128×128), 1071 (240×240), etc. | RGB565 LE | From libgpod |
+| iPod 4th Gen (Color) | 1016 (140×140), 1017 (56×56) | RGB565 LE | From libgpod |
+
+> [!NOTE]
+> iPod Classic uses format 1067 (720×480, I420/YCbCr 4:2:0) for **photos only**, not for cover art. Cover art on all tested models is exclusively RGB565 LE.
 
 ### Diagnostic Approach
 
@@ -400,6 +413,7 @@ When implementing for a new iPod model:
 
 ```python
 from artworkdb_writer import ArtworkDB, parse_itunesdb_dbids
+from ithmb_writer import IPOD_5G_FORMATS, IPOD_CLASSIC_FORMATS
 from PIL import Image
 from pathlib import Path
 
@@ -409,15 +423,15 @@ artwork_dir = ipod / 'iPod_Control' / 'Artwork'
 # 1. Get track IDs from iTunesDB
 tracks = parse_itunesdb_dbids(ipod)
 
-# 2. Build the artwork database
-db = ArtworkDB()
+# 2. Build the artwork database (pick formats for your device)
+db = ArtworkDB(formats=IPOD_CLASSIC_FORMATS)  # or IPOD_5G_FORMATS
 for track in tracks:
     img = Image.open('album_art.jpg').convert('RGB')
     db.add_artwork(track['dbid'], img)
 
 # 3. Write to iPod
 stats = db.write(artwork_dir)
-# Creates: ArtworkDB, F1028_1.ithmb, F1029_1.ithmb
+# Creates: ArtworkDB, F1055_1.ithmb, F1060_1.ithmb, F1061_1.ithmb
 ```
 
 The entire process takes ~1-2 seconds for 50 tracks, vs 5-10 minutes with COM `AddArtworkFromFile`.

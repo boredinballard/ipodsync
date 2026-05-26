@@ -26,7 +26,7 @@ from iTunesDB mhit+112, NOT the COM TrackDatabaseID.
 import struct
 from pathlib import Path
 from PIL import Image
-from ithmb_writer import IthmBuilder, IPOD_5G_FORMATS
+from ithmb_writer import IthmBuilder, IPOD_5G_FORMATS, IPOD_CLASSIC_FORMATS
 
 
 def parse_itunesdb_dbids(ipod_drive: Path) -> list:
@@ -121,6 +121,75 @@ def parse_itunesdb_dbids(ipod_drive: Path) -> list:
     return tracks
 
 
+def read_itunesdb_artwork_refs(ipod_drive: Path) -> dict:
+    """Read artwork reference IDs from iTunesDB mhit+352 for each track.
+
+    The iPod Classic 6G firmware uses mhit+352 (uint32) to look up artwork:
+    it matches this value against mhii.image_id in the ArtworkDB.
+
+    This function reads the EXISTING values set by iTunes COM during AddFile,
+    so we can use them as image_ids in the ArtworkDB without modifying the
+    iTunesDB (which would break its integrity hash).
+
+    This is ONLY relevant for 6G Classic. The 4th/5th gen firmware
+    matches artwork by song_dbid in the mhii record directly.
+
+    Args:
+        ipod_drive: iPod mount point (e.g. Path('D:/'))
+
+    Returns:
+        Mapping of {song_dbid: artwork_ref_id} for tracks that have a
+        non-zero artwork reference at mhit+352.
+    """
+    ARTWORK_ID_OFFSET = 352  # mhit+352: artwork reference (uint32)
+
+    itunesdb_path = ipod_drive / "iPod_Control" / "iTunes" / "iTunesDB"
+    if not itunesdb_path.exists():
+        return {}
+
+    data = itunesdb_path.read_bytes()
+    if len(data) < 244 or data[:4] != b'mhbd':
+        return {}
+
+    refs = {}
+    hdr_len = struct.unpack_from('<I', data, 4)[0]
+    num_sections = struct.unpack_from('<I', data, 20)[0]
+
+    pos = hdr_len
+    for _ in range(num_sections):
+        if pos + 16 > len(data):
+            break
+        s_hdr, s_total = struct.unpack_from('<II', data, pos + 4)
+        s_type = struct.unpack_from('<I', data, pos + 12)[0]
+
+        if s_type == 1:  # Track list
+            cpos = pos + s_hdr
+            if cpos + 12 > len(data) or data[cpos:cpos+4] != b'mhlt':
+                break
+            c_hdr = struct.unpack_from('<I', data, cpos + 4)[0]
+            c_count = struct.unpack_from('<I', data, cpos + 8)[0]
+
+            it_pos = cpos + c_hdr
+            for _ in range(c_count):
+                if it_pos + 120 > len(data) or data[it_pos:it_pos+4] != b'mhit':
+                    break
+                t_hdr = struct.unpack_from('<I', data, it_pos + 4)[0]
+                t_total = struct.unpack_from('<I', data, it_pos + 8)[0]
+
+                if t_hdr >= ARTWORK_ID_OFFSET + 4:
+                    dbid = struct.unpack_from('<Q', data, it_pos + 112)[0]
+                    art_ref = struct.unpack_from('<I', data, it_pos + ARTWORK_ID_OFFSET)[0]
+                    if dbid and art_ref:
+                        refs[dbid] = art_ref
+
+                it_pos += t_total
+            break
+
+        pos += s_total
+
+    return refs
+
+
 def _parse_mhod_string(data: bytes, mhod_pos: int, m_total: int) -> str:
     """Parse a string value from an iTunesDB mhod record.
 
@@ -176,16 +245,31 @@ class ArtworkDB:
     MHIF_HEADER_SIZE = 124
     DB_VERSION = 6
 
-    def __init__(self, formats: dict = None):
+    def __init__(self, formats: dict = None, artwork_refs: dict = None):
+        """Initialize ArtworkDB writer.
+
+        Args:
+            formats: Format definitions {fmt_id: (w, h, bpp, data_size)}.
+            artwork_refs: Optional {dbid: art_ref_id} from read_itunesdb_artwork_refs().
+                For Classic 6G, these are the existing mhit+352 values that the
+                firmware uses to look up artwork. When provided, the writer uses
+                these values as image_ids instead of generating new ones.
+        """
         self.formats = formats or IPOD_5G_FORMATS
         self._dbid_order: list[int] = []
         self._image_dedup: dict[int, int] = {}
         self._dbid_to_image_id: dict[int, int] = {}
         self._unique_images: dict[int, Image.Image] = {}
         self._next_image_id = 101  # Match COM behavior (starts at 101)
+        self._artwork_refs = artwork_refs or {}  # dbid → existing art_ref_id
 
     def add_artwork(self, song_dbid: int, image: Image.Image) -> int:
-        """Register artwork for a track. Returns image_id."""
+        """Register artwork for a track. Returns image_id.
+
+        If artwork_refs were provided (Classic 6G mode), the existing
+        mhit+352 value is used as the image_id for this track's album.
+        All tracks sharing the same artwork_ref get the same image.
+        """
         if song_dbid in self._dbid_to_image_id:
             return self._dbid_to_image_id[song_dbid]
 
@@ -193,8 +277,17 @@ class ArtworkDB:
         thumb = img_rgb.resize((32, 32), Image.NEAREST)
         img_hash = hash(thumb.tobytes())
 
+        # Classic 6G: use the existing mhit+352 value as image_id if available.
+        # Multiple tracks sharing the same art_ref (same album) will share
+        # the same image_id, achieving album-level dedup naturally.
+        existing_ref = self._artwork_refs.get(song_dbid, 0)
+
         if img_hash in self._image_dedup:
             image_id = self._image_dedup[img_hash]
+        elif existing_ref:
+            image_id = existing_ref
+            self._image_dedup[img_hash] = image_id
+            self._unique_images[image_id] = img_rgb
         else:
             image_id = self._next_image_id
             self._next_image_id += 1
@@ -211,8 +304,8 @@ class ArtworkDB:
 
         # Build .ithmb files
         builders: dict[int, IthmBuilder] = {}
-        for fmt_id, (w, h, bpp) in self.formats.items():
-            builders[fmt_id] = IthmBuilder(fmt_id, w, h)
+        for fmt_id, (w, h, bpp, data_size) in self.formats.items():
+            builders[fmt_id] = IthmBuilder(fmt_id, w, h, image_data_size=data_size)
 
         sorted_ids = sorted(self._unique_images.keys())
         image_offsets: dict[int, dict[int, int]] = {}
@@ -239,17 +332,36 @@ class ArtworkDB:
             'formats': list(self.formats.keys()),
             'db_size': len(db_data),
             'ithmb_files': {b.filename: len(b.get_data()) for b in builders.values()},
+            'dbid_to_image_id': dict(self._dbid_to_image_id),
         }
 
     def _build_artworkdb(self, image_offsets: dict, builders: dict) -> bytes:
-        """Serialize the complete ArtworkDB binary (v6 format)."""
-        # Build mhii entries
-        mhii_data = bytearray()
-        mhii_count = 0
+        """Serialize the complete ArtworkDB binary (v6 format).
+
+        One mhii entry per unique image (album-level dedup). Each mhii
+        has mhod type=2 children (one per format) + mhod type=6/mhaf.
+
+        The firmware matches tracks to artwork via mhit+352 in the
+        iTunesDB referencing mhii.image_id. Use patch_itunesdb_artwork_ids()
+        after writing to set these references (needed for Classic 6G only;
+        4th/5th gen match by song_dbid directly).
+        """
+        # Build mhii entries — one per unique image (album-level)
+        # Dedup maps image_id to the first song_dbid that uses it
+        image_id_to_dbid: dict[int, int] = {}
         for song_dbid in self._dbid_order:
             image_id = self._dbid_to_image_id[song_dbid]
-            source_size = 0  # We don't know original JPEG size
-            mhii_bytes = self._pack_mhii(image_id, song_dbid, image_offsets[image_id], source_size)
+            if image_id not in image_id_to_dbid:
+                image_id_to_dbid[image_id] = song_dbid
+
+        mhii_data = bytearray()
+        mhii_count = 0
+
+        for image_id in sorted(image_id_to_dbid.keys()):
+            rep_dbid = image_id_to_dbid[image_id]
+            offsets = image_offsets[image_id]
+            mhii_bytes = self._pack_mhii(image_id, rep_dbid, offsets,
+                                          source_size=50000)
             mhii_data.extend(mhii_bytes)
             mhii_count += 1
 
@@ -260,9 +372,8 @@ class ArtworkDB:
         mhsd2_data = self._pack_mhsd(2, mhla_data)
 
         mhif_data = bytearray()
-        for fmt_id, (w, h, bpp) in sorted(self.formats.items()):
-            img_size = w * h * bpp
-            mhif_data.extend(self._pack_mhif(fmt_id, img_size))
+        for fmt_id, (w, h, bpp, data_size) in sorted(self.formats.items()):
+            mhif_data.extend(self._pack_mhif(fmt_id, data_size))
         mhlf_data = self._pack_mhlf(len(self.formats), bytes(mhif_data))
         mhsd3_data = self._pack_mhsd(3, mhlf_data)
 
@@ -349,12 +460,11 @@ class ArtworkDB:
         num_children = 0
 
         for fmt_id in sorted(self.formats.keys()):
-            w, h, bpp = self.formats[fmt_id]
+            w, h, bpp, data_size = self.formats[fmt_id]
             ithmb_offset = offsets.get(fmt_id, 0)
-            img_size = w * h * bpp
             filename = ":F" + f"{fmt_id}_1.ithmb"
 
-            mhod2 = self._pack_mhod2_with_mhni(fmt_id, ithmb_offset, img_size,
+            mhod2 = self._pack_mhod2_with_mhni(fmt_id, ithmb_offset, data_size,
                                                   w, h, filename)
             children_data.extend(mhod2)
             num_children += 1
@@ -381,6 +491,28 @@ class ArtworkDB:
         struct.pack_into('<I', buf, 84, 0x7FF80000)
 
         return bytes(buf) + bytes(children_data)
+
+    def _pack_mhii_placeholder(self, image_id: int, song_dbid: int) -> bytes:
+        """Pack a placeholder mhii record (152 bytes header, 1 child).
+
+        The Classic firmware expects a placeholder mhii for each track,
+        containing just an mhod type=6/mhaf child with no image data.
+        This precedes the actual data mhii in the mhli list.
+        """
+        mhod6 = self._pack_mhod6()
+        total_size = self.MHII_HEADER_SIZE + len(mhod6)
+
+        buf = bytearray(self.MHII_HEADER_SIZE)
+        struct.pack_into('<4sIII', buf, 0,
+                         b'mhii',
+                         self.MHII_HEADER_SIZE,
+                         total_size,
+                         1)  # 1 child (just mhod6)
+        struct.pack_into('<I', buf, 16, image_id)
+        struct.pack_into('<Q', buf, 20, song_dbid)
+        # No source_size, no flags — matches observed placeholder structure
+
+        return bytes(buf) + mhod6
 
     def _pack_mhod6(self) -> bytes:
         """Pack mhod type=6 with embedded mhaf placeholder.
